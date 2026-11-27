@@ -12,6 +12,7 @@ pub mod config;
 pub mod keybinds;
 pub mod logging;
 pub mod policy;
+pub mod preload;
 pub mod story_clock;
 pub mod tunables;
 
