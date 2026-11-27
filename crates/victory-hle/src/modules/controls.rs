@@ -14,6 +14,8 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
 
+use victory_core::keybinds::{Def, Setup, Table};
+
 use super::gameinput::{
     A, B, DOWN, LEFT, LEFT_SHOULDER, LEFT_STICK, MENU, PadState, RIGHT, RIGHT_SHOULDER,
     RIGHT_STICK, UP, VIEW, X, Y,
@@ -262,6 +264,18 @@ impl Layout {
         Ok(())
     }
 
+    /// The layout a table of key names and pad outputs makes (a binding that does not parse is left out).
+    fn from_table(table: &Table) -> Layout {
+        let mut layout = Layout::default();
+        for (key, binds) in table {
+            let outs: Vec<&str> = binds.iter().map(String::as_str).collect();
+            if let Err(why) = layout.bind(key, &outs) {
+                tracing::warn!(%why, "controls: a binding was left out");
+            }
+        }
+        layout
+    }
+
     fn of(table: &[(&str, &[&str])]) -> Layout {
         let mut layout = Layout::default();
         for (key, outs) in table {
@@ -427,6 +441,8 @@ pub struct Options {
     pub on_foot: BTreeMap<String, Vec<String>>,
     pub vehicle: BTreeMap<String, Vec<String>>,
     pub aircraft: BTreeMap<String, Vec<String>>,
+    /// The controls file the run was started from: the menu's CONTROLS page saves into it.
+    pub config_path: Option<std::path::PathBuf>,
 }
 
 impl Settings {
@@ -531,6 +547,10 @@ pub fn configure(options: Option<&Options>) -> Result<(), String> {
         curve = s.curve,
         "keyboard and mouse controls"
     );
+    if let Some(options) = options {
+        victory_core::keybinds::install(bindings_setup(&s, options));
+        victory_core::keybinds::set_namer(name_for_vk);
+    }
     let _ = SETTINGS.set(s);
     Ok(())
 }
@@ -601,6 +621,142 @@ fn title_vehicle() -> Option<bool> {
 #[cfg(not(windows))]
 fn title_vehicle() -> Option<bool> {
     None
+}
+
+// ---------------------------------------------------------------------------
+// The CONTROLS page of the in-game menu (`victory_core::keybinds`).
+
+/// The lines the page lists for the on-foot layout: the pad output a key is bound to (the name the
+/// controls file uses) and what it does there.
+const PAGE_ON_FOOT: &[(&str, &str, &str)] = &[
+    ("LeftUp", "Move forward", "left stick up"),
+    ("LeftDown", "Move back", "left stick down"),
+    ("LeftLeft", "Move left", "left stick left"),
+    ("LeftRight", "Move right", "left stick right"),
+    ("Walk", "Walk slowly (hold)", "left stick at walk speed"),
+    ("A", "Sprint / menu confirm", "A"),
+    ("X", "Jump", "X"),
+    ("Y", "Interact / enter vehicle", "Y"),
+    ("ToggleVehicle", "Switch to vehicle keys", "no pad button, switches the key layout"),
+    ("B", "Reload / menu back", "B"),
+    ("RB", "Cover / quick throw", "RB"),
+    ("LB", "Weapon wheel / holster", "LB"),
+    ("LT", "Aim", "LT"),
+    ("RT", "Shoot", "RT"),
+    ("LS", "Crouch / left stick click", "LS click"),
+    ("RS", "Right stick click", "RS click"),
+    ("View", "Map / view", "View"),
+    ("Menu", "Pause", "Menu"),
+    ("DpadUp", "D-pad up", "D-pad up"),
+    ("DpadDown", "D-pad down", "D-pad down"),
+    ("DpadLeft", "D-pad left", "D-pad left"),
+    ("DpadRight", "D-pad right", "D-pad right"),
+    ("ReleaseCursor", "Free the mouse", "frees the mouse"),
+];
+
+const PAGE_VEHICLE: &[(&str, &str, &str)] = &[
+    ("RT", "Accelerate", "RT"),
+    ("LT", "Brake / reverse", "LT"),
+    ("LeftLeft", "Steer left", "left stick left"),
+    ("LeftRight", "Steer right", "left stick right"),
+    ("LeftUp", "Lean forward (bikes)", "left stick up"),
+    ("LeftDown", "Lean back (bikes)", "left stick down"),
+    ("A", "Handbrake / menu confirm", "A"),
+    ("LS", "Horn / left stick click", "LS click"),
+    ("Y", "Interact / enter or exit vehicle", "Y"),
+    ("ToggleVehicle", "Switch to on-foot keys", "no pad button, switches the key layout"),
+    ("B", "Headlights / menu back", "B"),
+    ("RS", "Look behind", "RS click"),
+    ("RB", "Shoot from the vehicle", "RB"),
+    ("LB", "Aim from the vehicle", "LB"),
+    ("View", "Map / view", "View"),
+    ("Menu", "Pause", "Menu"),
+    ("DpadUp", "D-pad up", "D-pad up"),
+    ("DpadDown", "D-pad down", "D-pad down"),
+    ("DpadLeft", "D-pad left", "D-pad left"),
+    ("DpadRight", "D-pad right", "D-pad right"),
+    ("ReleaseCursor", "Free the mouse", "frees the mouse"),
+];
+
+const PAGE_AIRCRAFT: &[(&str, &str, &str)] = &[
+    ("RT", "Throttle up", "RT"),
+    ("LT", "Throttle down", "LT"),
+    ("LB", "Yaw left", "LB"),
+    ("RB", "Yaw right", "RB"),
+    ("LeftUp", "Pitch down", "left stick up"),
+    ("LeftDown", "Pitch up", "left stick down"),
+    ("LeftLeft", "Roll left", "left stick left"),
+    ("LeftRight", "Roll right", "left stick right"),
+    ("A", "Fire / menu confirm", "A"),
+    ("LS", "Landing gear / left stick click", "LS click"),
+    ("Y", "Interact / enter or exit vehicle", "Y"),
+    ("ToggleVehicle", "Switch to on-foot keys", "no pad button, switches the key layout"),
+    ("B", "Menu back", "B"),
+    ("RS", "Look behind", "RS click"),
+    ("View", "Map / view", "View"),
+    ("Menu", "Pause", "Menu"),
+    ("DpadUp", "D-pad up", "D-pad up"),
+    ("DpadDown", "D-pad down", "D-pad down"),
+    ("DpadLeft", "D-pad left", "D-pad left"),
+    ("DpadRight", "D-pad right", "D-pad right"),
+    ("ReleaseCursor", "Free the mouse", "frees the mouse"),
+];
+
+/// A key name as the controls file spells it (`Shift` is `LShift`; names that are not keys stay as they are).
+fn canonical_key(name: &str) -> String {
+    key_code(name).map_or_else(|| name.trim().to_owned(), key_name)
+}
+
+fn default_table(rows: &[&[(&str, &[&str])]]) -> Table {
+    let mut table = Table::new();
+    for &(key, outs) in rows.iter().flat_map(|r| r.iter()) {
+        table.insert(canonical_key(key), outs.iter().filter(|o| !o.trim().is_empty()).map(|o| (*o).to_owned()).collect());
+    }
+    table
+}
+
+fn laid_over(mut table: Table, file: &BTreeMap<String, Vec<String>>) -> Table {
+    for (key, outs) in file {
+        table.insert(canonical_key(key), outs.iter().filter(|o| !o.trim().is_empty()).cloned().collect());
+    }
+    table
+}
+
+/// What the CONTROLS page is given: its lines, the defaults and the bindings in force.
+fn bindings_setup(s: &Settings, options: &Options) -> Setup {
+    let defs = |list: &[(&str, &str, &str)]| -> Vec<Def> { list.iter().map(|&(id, label, pad)| Def::new(id, label, pad)).collect() };
+    let foot = default_table(&[ON_FOOT]);
+    let vehicle = default_table(&[VEHICLE]);
+    let aircraft = default_table(&[VEHICLE, AIRCRAFT]);
+    Setup {
+        defs: [defs(PAGE_ON_FOOT), defs(PAGE_VEHICLE), defs(PAGE_AIRCRAFT)],
+        current: [
+            laid_over(foot.clone(), &options.on_foot),
+            laid_over(vehicle.clone(), &options.vehicle),
+            laid_over(aircraft.clone(), &options.aircraft),
+        ],
+        defaults: [foot, vehicle, aircraft],
+        source: options.config_path.clone(),
+        aircraft_active: options.aircraft_vehicle,
+        active: s.enabled,
+    }
+}
+
+/// The controls file's name of the virtual key `vk` as the title will see it: with
+/// `keys_by_position` the key at that place of a US keyboard. `None` for a key the file
+/// has no name for.
+fn name_for_vk(vk: u8) -> Option<String> {
+    #[cfg(windows)]
+    let vk = if vk >= 0x08 && SETTINGS.get().is_none_or(|s| s.by_position) {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{MAPVK_VK_TO_VSC_EX, MapVirtualKeyW};
+        // SAFETY: a plain query.
+        let scan = unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) };
+        us_key(scan).unwrap_or(vk)
+    } else {
+        vk
+    };
+    let name = key_name(vk);
+    (key_code(&name) == Some(vk)).then_some(name)
 }
 
 /// Mouse motion and wheel steps since they were last drained, added from
@@ -739,6 +895,8 @@ pub(super) struct Controls {
     last_used: Option<Owner>,
     /// The release key was pressed: the host frees or captures the cursor.
     pub(super) toggle_capture: bool,
+    /// The count of the CONTROLS page's changes the layouts were last built from.
+    bindings_seen: u64,
 }
 
 impl Controls {
@@ -758,7 +916,23 @@ impl Controls {
             right_owner: Owner::Kbm,
             last_used: None,
             toggle_capture: false,
+            bindings_seen: victory_core::keybinds::generation(),
         }
+    }
+
+    /// Builds the layouts again from the tables of the CONTROLS page when it changed them
+    /// (`generation` is its change count).
+    fn follow_bindings(&mut self, generation: u64, tables: impl FnOnce() -> Option<(Table, Table)>) {
+        if generation == self.bindings_seen {
+            return;
+        }
+        self.bindings_seen = generation;
+        let Some((foot, vehicle)) = tables() else { return };
+        self.s.on_foot = Layout::from_table(&foot);
+        self.s.vehicle = Layout::from_table(&vehicle);
+        self.latched = 0;
+        self.latched_triggers = (false, false);
+        tracing::info!("controls: bindings changed in the menu");
     }
 
     fn layout(&self) -> &Layout {
@@ -820,6 +994,7 @@ impl Controls {
     }
 
     fn feed_with_vehicle(&mut self, held: &[u8], counts: &Counts, detected: Option<bool>) {
+        self.follow_bindings(victory_core::keybinds::generation(), victory_core::keybinds::live_tables);
         if let Some(vehicle) = detected && self.last_title_vehicle != Some(vehicle) {
             self.last_title_vehicle = Some(vehicle);
             self.vehicle = vehicle;
@@ -1422,5 +1597,104 @@ mod tests {
             ..Options::default()
         };
         assert!(!Settings::with_options(&off).unwrap().enabled);
+    }
+
+    #[test]
+    fn the_controls_page_lists_only_outputs_the_layouts_can_resolve() {
+        for list in [PAGE_ON_FOOT, PAGE_VEHICLE, PAGE_AIRCRAFT] {
+            let mut seen = Vec::new();
+            for &(id, label, pad) in list {
+                assert!(output(id).is_some(), "{id} is no pad output");
+                assert!(!label.is_empty() && !pad.is_empty() && !seen.contains(&id), "{id}");
+                seen.push(id);
+            }
+        }
+        // Every output a default key makes has a line on the page of its layout.
+        for (list, table) in [(PAGE_ON_FOOT, ON_FOOT), (PAGE_VEHICLE, VEHICLE), (PAGE_AIRCRAFT, AIRCRAFT)] {
+            for (key, outs) in table {
+                for out in *outs {
+                    assert!(list.iter().any(|(id, _, _)| id == out), "{key}: {out}");
+                }
+            }
+        }
+        // Each default key table reads back as the layout the tables of the page make.
+        assert_eq!(Layout::from_table(&default_table(&[ON_FOOT])), Layout::of(ON_FOOT));
+        assert_eq!(Layout::from_table(&default_table(&[VEHICLE])), Layout::of(VEHICLE));
+        let aircraft = Settings::with_options(&Options { aircraft_vehicle: true, ..Options::default() }).unwrap();
+        assert_eq!(Layout::from_table(&default_table(&[VEHICLE, AIRCRAFT])), aircraft.vehicle);
+    }
+
+    #[test]
+    fn the_controls_page_gets_the_defaults_and_the_file_laid_over() {
+        let options = Options {
+            config_path: Some("victory.toml".into()),
+            on_foot: BTreeMap::from([("shift".to_owned(), vec![String::new()]), ("Z".to_owned(), vec!["A".to_owned()])]),
+            ..Options::default()
+        };
+        let setup = bindings_setup(&Settings::default(), &options);
+        assert!(setup.active && !setup.aircraft_active);
+        assert_eq!(setup.source.as_deref(), Some(std::path::Path::new("victory.toml")));
+        // "shift" is the file's alias of LShift; it unbinds the default A key, and Z takes it.
+        assert_eq!(setup.defaults[0]["LShift"], ["A"]);
+        assert!(setup.current[0]["LShift"].is_empty());
+        assert_eq!(setup.current[0]["Z"], ["A"]);
+        assert_eq!(setup.current[1], setup.defaults[1]);
+        // The aircraft table is the vehicle one with the flight keys over it.
+        assert_eq!(setup.defaults[2]["W"], ["RT"]);
+        assert!(setup.defaults[2]["Space"].is_empty());
+        assert_eq!(setup.defaults[2]["G"], ["LS"]);
+        let pad = |layout: usize, id: &str| setup.defs[layout].iter().find(|d| d.id == id).unwrap().pad.clone();
+        assert_eq!((pad(0, "X").as_str(), pad(1, "LS").as_str()), ("X", "LS click"));
+    }
+
+    #[test]
+    fn the_layouts_follow_the_menus_changes_once_and_at_once() {
+        // Fed without the page's registry (which other tests share): only the tables given are followed.
+        let pressed = |c: &mut Controls, key: &str| {
+            // (A read follows the registry's own count; the test keeps the count it set.)
+            let seen = std::mem::replace(&mut c.bindings_seen, victory_core::keybinds::generation());
+            c.feed_with_vehicle(&[vk(key)], &Counts::default(), None);
+            let buttons = c.peek(None).buttons;
+            c.feed_with_vehicle(&[], &Counts::default(), None);
+            c.bindings_seen = seen;
+            buttons
+        };
+        let mut foot = default_table(&[ON_FOOT]);
+        let vehicle = default_table(&[VEHICLE]);
+        // Jump moves from Space to J.
+        foot.insert("Space".into(), Vec::new());
+        foot.insert("J".into(), vec!["X".into()]);
+        let mut c = controls();
+        c.bindings_seen = u64::MAX;
+        assert_eq!(pressed(&mut c, "Space"), X, "Space jumps before the change");
+        let mut c = controls();
+        c.bindings_seen = 4;
+        c.follow_bindings(5, || Some((foot.clone(), vehicle.clone())));
+        assert_eq!(pressed(&mut c, "Space"), 0);
+        assert_eq!(pressed(&mut c, "J"), X);
+        // The same change count builds nothing again (a table that is gone is not asked for).
+        c.follow_bindings(5, || panic!("asked twice"));
+        // A count with no tables leaves the layouts as they are.
+        c.follow_bindings(6, || None);
+        assert_eq!(pressed(&mut c, "J"), X);
+        // The vehicle table builds the vehicle layout.
+        let mut car = vehicle;
+        car.insert("Q".into(), vec!["A".into()]);
+        c.follow_bindings(7, || Some((foot, car)));
+        c.vehicle = true;
+        assert_eq!(pressed(&mut c, "Q"), A);
+    }
+
+    #[test]
+    fn key_names_of_the_page_need_a_name_the_file_reads_back() {
+        for vk in [b'W', 0x20, 0x70, 0x01, 0x05, 0xA0, 0xBA] {
+            let name = name_for_vk(vk).unwrap_or_else(|| panic!("{vk:#x}"));
+            assert!(key_code(&name).is_some(), "{name}");
+        }
+        assert_eq!(name_for_vk(0x01).as_deref(), Some("MouseLeft"));
+        // Keys with no name in the file are refused (a hex name would stop the next start).
+        assert_eq!(name_for_vk(0x5B), None);
+        assert_eq!(canonical_key("shift"), "LShift");
+        assert_eq!(canonical_key("w"), "W");
     }
 }

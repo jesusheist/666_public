@@ -1839,6 +1839,8 @@ mod host {
                     .filter(|vk| !(0x10..=0x12).contains(vk) && !down.contains(vk))
                     // SAFETY: plain queries.
                     .filter(|&vk| unsafe { GetAsyncKeyState(i32::from(vk)) } < 0)
+                    // The in-game menu (F10) takes the keys it uses, and ones still held that it took.
+                    .filter(|&vk| !victory_gpu::menu_takes_key(vk))
                     .collect();
                 down.extend(held);
             }

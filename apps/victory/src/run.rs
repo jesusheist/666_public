@@ -56,6 +56,7 @@ pub fn run(
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
     let mut cfg = victory_core::Config::load()?;
+    let source = cfg.source.clone();
     let controls = cfg.controls.take().map(|settings| {
         let bindings =
             |table: std::collections::BTreeMap<_, victory_core::config::ControlBinding>| {
@@ -83,6 +84,7 @@ pub fn run(
             on_foot: bindings(settings.on_foot),
             vehicle: bindings(settings.vehicle),
             aircraft: bindings(settings.aircraft),
+            config_path: source,
         }
     });
     victory_hle::modules::controls::configure(controls.as_ref()).map_err(anyhow::Error::msg)?;
