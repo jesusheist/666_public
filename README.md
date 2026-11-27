@@ -1,9 +1,109 @@
 # 666
 
-**Branch `kb`**: keyboard and mouse. Work here goes into the PC layout
-(`[controls]`), the automatic vehicle layout (`VICTORY_VEHICLE_FLAG`), the key prompts
-(`VICTORY_PROMPTS=keys`) and the remote pad. Next: the aircraft and boat layouts found the same way
-as the car flag, and key prompts that follow the layout when it changes.
+**Branch `kb`**: keyboard and mouse.
+
+## Playing with keyboard and mouse
+
+The title reads gamepads and keyboards only, so keys and the mouse drive a stand-in gamepad: keys become
+buttons and sticks, the mouse becomes the right stick, mouse buttons the triggers. Mouse movement is turned
+into a turn rate from the time between the title's reads, so the camera turns the same angle for the same
+hand movement at any frame rate.
+
+### Turn it on
+
+In `victory.toml`:
+
+```toml
+[controls]
+enabled = true
+```
+
+and, so the layout follows getting in and out of a car by itself (build 1.0.2.1):
+
+```powershell
+$env:VICTORY_VEHICLE_FLAG = "img+74dfca5"
+```
+
+Without the flag, **F** gets in or out (it presses the pad's Y and switches the layout) and **G** switches
+the layout by hand. With the flag the layout follows the title itself; F and G still work and stand until
+the flag next changes. The flag is the title's own byte, 0 on foot and 1 in a car, found with the memory
+scanner and checked over two launches. Format: `<hex address | img+hex offset>[:width 1|2|4][:value in a vehicle]`.
+
+### Default keys
+
+| Key | On foot | In a vehicle (land and water) |
+|---|---|---|
+| W A S D | Move | Accelerate, steer left, brake and reverse, steer right |
+| Mouse | Camera | Camera |
+| Mouse left / right | Shoot / aim | Shoot / aim |
+| Mouse middle | Look behind | Look behind |
+| Wheel up / down | Scope in / out | Scope in / out |
+| Space | Jump | Handbrake |
+| Left Shift | Sprint | |
+| Left Alt | Walk | |
+| Left Ctrl | Crouch | Duck |
+| C | Crouch | Look behind |
+| E | | Horn |
+| H | | Headlights |
+| F | Get in | Get out |
+| G | Switch layout by hand | Switch layout by hand |
+| R | Melee | Melee |
+| Q | Cover | |
+| Tab | Holster | Holster |
+| V or M | Map | Map |
+| Arrow up | Phone | Phone |
+| Arrow down | Detonate | Partner menu |
+| Arrow left / right | Radio / objective | Indicate left / right |
+| Numpad 8 / 5 | | Lean forward / back (bikes) |
+| Enter / Backspace | Pad A / B (menus) | Pad A / B (menus) |
+| Esc | Menu, and frees the cursor | Menu, and frees the cursor |
+| P | Pause | Pause |
+
+Aircraft (`vehicle_layout = "aircraft"`) lay over the vehicle keys: W / S throttle up / down, A / D yaw,
+numpad 8 5 4 6 pitch and roll, G undercarriage.
+
+Keys go by their place on a US keyboard (`keys_by_position = true`), so W A S D sit where they do on any
+layout (Z Q S D on AZERTY).
+
+### Rebinding
+
+A table replaces only the keys it names:
+
+```toml
+[controls.on_foot]
+Space = "X"
+Tab = ["tap:Holster", "hold400:Loadout"]   # quick tap, long press
+CapsLock = "toggle:Sprint"                  # run on, run off
+X = "macro:Y 60, wait 100, A 60"            # interact, then jump
+
+[controls.vehicle]
+W = "RT"
+```
+
+A value is a pad output (A B X Y LB RB LT RT LS RS View Menu, DpadUp ... DpadRight, LeftUp ... RightRight),
+an action (Jump, Sprint, Crouch, Shoot, Accelerate, ToggleVehicle, ReleaseCursor ...), a list of them, or
+`""` to unbind. Styles: `tap[ms]`, `hold[ms]`, `double[ms]`, `toggle`, `macro:` (up to 16 steps).
+
+Mouse and stick settings, all optional: `mouse_sensitivity` (1.0 = 2,000 counts a second for a full
+stick), `mouse_y_scale`, `mouse_invert_y`, `mouse_capture`, `mouse_carry`, `stick_deadzone`,
+`stick_curve`, `walk_speed`, `start_in_vehicle`. See `victory.example.toml`.
+
+### Key prompts
+
+`VICTORY_PROMPTS=keys` draws the key you press in place of the gamepad button pictures, taken from the
+layout in force. It works on build 1.0.2.1. The pictures are drawn once, so they keep the layout of that
+moment, and animated prompts keep their own pictures.
+
+### Remote pad
+
+Over MCP (`VICTORY_MCP=47820`): `press`, `stick`, `release_all`, `input_script`. A script or an
+agent can play without the window having focus, for example `input_script` with `"A 120, wait 500,
+LeftUp 2000"`.
+
+### Next on this branch
+
+The aircraft and boat layouts found the same way as the car flag, and key prompts that follow the layout
+when it changes.
 
 A fork of the VIctory runtime (by way of cool_fox) that plays the Xbox Series build
 of the title on a Windows PC. The focus here is playing it with a keyboard and
