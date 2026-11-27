@@ -1,3 +1,98 @@
+# JESUS666: cheat menu with ScriptHook VI
+
+This branch is the JESUS666 build of VIctory (SkillIssueXO's BEST ONE YET line plus our own work). It adds an
+in-game cheat menu that drives [ScriptHook VI](https://github.com/modpapi/scripthook-vi) from inside the runtime,
+so you get trainer features without a second overlay.
+
+## What you get
+
+Open the menu with **F10** (or F1) and go to the **CHEATS** page. It has two parts.
+
+**Title cheats.** The game's own cheat table, run on the game's thread (switch `VICTORY_CHEATS=1`):
+
+| Line | What it does |
+| --- | --- |
+| WANTED LEVEL UP (CHEAT 3) | About one star up (not exact) |
+| WANTED DOWN + FLAG (CHEAT 4) | About one star down |
+| CHEAT 2 (REFILL, UNSURE) | Effect not confirmed yet |
+| CHEAT 6 (NEXT WEATHER?) | Effect not confirmed yet |
+
+**SCRIPTHOOK section.** Shown only when ScriptHook VI is loaded. Every line calls game functions (natives) through
+ScriptHook VI's C interface, and a line only appears if the running game has all the natives it needs.
+
+| Line | Kind |
+| --- | --- |
+| GOD MODE | toggle |
+| NEVER WANTED | toggle |
+| POLICE IGNORE PLAYER | toggle |
+| KEEP HEALTH FULL | toggle |
+| FAST RUN (1.5x) | toggle |
+| NO RAGDOLL | toggle |
+| HEAL | press |
+| RESTORE ALL VITALS | press |
+| CLEAR WANTED LEVEL | press |
+| SET WANTED LEVEL (0 to 5 stars) | value |
+| REPAIR VEHICLE | press |
+| TELEPORT TO WAYPOINT | press (set a map waypoint first) |
+| WEATHER | value (Left / Right) |
+| TIME OF DAY (SCRIPTHOOK) | value (6 presets) |
+| SPAWN SULTAN, BANSHEE, BUFFALO, COMET 7, INFERNUS 2, RUINER | press, only with `SHVI_EXPERIMENTAL_VEHICLE=1` |
+
+Without ScriptHook VI the section shows a single line, `SCRIPTHOOK NOT LOADED (VICTORY_LOAD_DLLS)`.
+After each press the line under the list says what happened (for example `REPAIR VEHICLE: Not in a vehicle`).
+
+## How to set it up
+
+1. Build this branch: `cargo build --locked --release -p victory`.
+2. Build ScriptHook VI from [modpapi/scripthook-vi](https://github.com/modpapi/scripthook-vi) (its `build.cmd`).
+   You need `shvi_core.dll`, its `natives` folder and the plugins you want (the sample `trainer.asi` goes in
+   `plugins`).
+3. Put them in a folder of their own, for example `C:\shvi-home\shvi\`:
+   ```
+   C:\shvi-home\shvi\shvi_core.dll
+   C:\shvi-home\shvi\natives\...
+   C:\shvi-home\shvi\plugins\trainer.asi
+   ```
+4. Make a hard link to the game exe in that folder (it keeps ScriptHook's files out of your game folder):
+   ```
+   mklink /H C:\shvi-home\game_scarlett_master.exe "<your game folder>\game_scarlett_master.exe"
+   ```
+5. Start the game with two extra switches:
+   ```
+   victory.exe play "<your game folder>\game_scarlett_master.exe" --series-s --res 1080 --dlss quality ^
+     --set VICTORY_LOAD_DLLS=C:\shvi-home\shvi\shvi_core.dll ^
+     --set VICTORY_SHVI_HOME=C:\shvi-home ^
+     --set VICTORY_CHEATS=1
+   ```
+6. Check `C:\shvi-home\shvi\shvi.log`. It should contain `(hosted start)` and `ready: 1 plugin(s)`.
+   The launcher log shows `host dll ...shvi_core.dll: victory_on_title_mapped returned 0`.
+
+## How it works
+
+- `VICTORY_LOAD_DLLS` (apps/victory/src/run.rs) loads each listed DLL after the title is mapped and before any
+  title code runs, and calls its `victory_on_title_mapped` export with the image base, size and exe path.
+  `VICTORY_SHVI_HOME` makes the DLL see the exe inside that folder, so it keeps its files there.
+- The menu (crates/victory-gpu/src/shvi.rs) finds `shvi_core.dll` in the process and takes its function table
+  (`shvi_get_api`). The menu thread never calls a native: a press only queues a request. A per-frame callback
+  registered with ScriptHook (`tick_register`) runs on the game thread and executes the queue. Toggles that are on
+  are applied again every 750 ms (fast run every frame), because the game's own scripts reset the same state.
+- ScriptHook VI's online guard stays in charge: if it latches (online session or an anti-cheat client), the
+  callback does nothing. Story mode only.
+- Window hook fix: with ScriptHook's overlay on the window, our window procedure no longer hooks the window a
+  second time on focus changes (that loop overflowed the stack in earlier builds).
+
+## Status
+
+- Tested live: hosted start, the sample trainer loading (F4) and the window fix.
+- Tested with unit tests only, not yet in game: the SCRIPTHOOK lines themselves. Known open points: wanted level
+  raise (ScriptHook has not shown its native working), weather names past the first five (shown as OTHER 1 to
+  OTHER 9), and the experimental vehicle spawns.
+
+Other switches in this build (keyboard and mouse layouts, shader preload screen, debug MCP tools) are listed in
+the menu itself. The original VIctory on NVIDIA README follows.
+
+---
+
 # VIctory on NVIDIA
 
 See the [BEST ONE YET checkpoint](docs/best-one-yet.md) for the tested RTX 5070 Ti launch settings and local water cache details.
