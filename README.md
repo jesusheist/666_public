@@ -1,5 +1,19 @@
 # 666
 
+**Branch `texture-pool`**: card memory for textures.
+
+What works now:
+- F10 menu: the texture pool (Auto, or 4 to 20 GB; sizes above the card's budget less 1.5 GB are not
+  offered) and eviction on or off, with readouts of the card's memory and the pool in use. Changes are live
+  and kept in `victory-live.toml`.
+- `VICTORY_TEXTURE_BUDGET_MB`: the pool size to start with. `VICTORY_EVICT=1`: copies not used for a
+  while are let go (`VICTORY_EVICT_MIN_FRAMES`, 120 by default). `VICTORY_TEXTURE_POOL`: textures in
+  shared blocks (on by default).
+- `VICTORY_LEVELS_ON_DEMAND=0`: on one test machine (RTX 4090) it about halved card memory (around 10 GB
+  against 20 GB) at the same frame rate.
+
+Next on this branch: eviction that knows what the title is about to draw, and fewer texture re-uploads.
+
 A fork of the VIctory runtime (by way of cool_fox) that plays the Xbox Series build
 of the title on a Windows PC. The focus here is playing it with a keyboard and
 mouse, plus tools to find what the title keeps in memory.
