@@ -13,6 +13,7 @@
 //! ([`take_shot_request`]), reads the frame back and hands it over a channel.
 
 pub mod badpix;
+mod history;
 mod http;
 mod json;
 mod layer;
@@ -37,6 +38,7 @@ pub use memscan::{MemHooks, MemRegion, set_mem_hooks};
 pub use protocol::{PROTOCOL_VERSION, handle_body, Outcome};
 pub use server::{ServerHandle, start};
 pub use badpix::{ScanParams, ScanReport};
+pub use history::TranslationSource;
 pub use shot::RawFrame;
 
 use ring::Ring;
@@ -227,6 +229,8 @@ pub struct PipelineEvent {
     /// Milliseconds since the server started.
     pub at_ms: f64,
     pub duration_ms: Option<f64>,
+    /// For a translation: where it came from.
+    pub source: Option<TranslationSource>,
 }
 
 /// A screenshot asked for, to be answered by the present path.
@@ -284,6 +288,8 @@ pub struct Shared {
     stats: Mutex<Option<(Stats, Instant)>>,
     pub(crate) log: Ring<Arc<str>>,
     pub(crate) events: Ring<Arc<PipelineEvent>>,
+    /// One summary per shader hash for the whole run.
+    pub(crate) history: history::History,
     device_lost: Mutex<Option<Arc<str>>>,
     shot: Mutex<Option<ShotRequest>>,
     /// One screenshot at a time.
@@ -305,6 +311,7 @@ impl Shared {
             stats: Mutex::new(None),
             log: Ring::new(LOG_LINES),
             events: Ring::new(EVENTS),
+            history: history::History::new(),
             device_lost: Mutex::new(None),
             shot: Mutex::new(None),
             shot_gate: Mutex::new(()),
@@ -339,7 +346,21 @@ impl Shared {
         frame: u64,
         duration_ms: Option<f64>,
     ) {
-        self.events.push(Arc::new(PipelineEvent {
+        self.record_event_from(kind, hash, stage, detail, frame, duration_ms, None);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_event_from(
+        &self,
+        kind: &'static str,
+        hash: &str,
+        stage: Option<&str>,
+        detail: Option<&str>,
+        frame: u64,
+        duration_ms: Option<f64>,
+        source: Option<TranslationSource>,
+    ) {
+        let event = Arc::new(PipelineEvent {
             kind,
             hash: hash.to_owned(),
             stage: stage.map(str::to_owned),
@@ -347,7 +368,10 @@ impl Shared {
             frame,
             at_ms: self.started.elapsed().as_secs_f64() * 1000.0,
             duration_ms,
-        }));
+            source,
+        });
+        self.history.record(&event);
+        self.events.push(event);
     }
 
     /// Keeps the report of the first device loss (a later one adds nothing).
@@ -524,6 +548,21 @@ pub fn pipeline_event(
 ) {
     if let Some(shared) = SHARED.get() {
         shared.record_event(kind, hash, stage, detail, frame, duration_ms);
+    }
+}
+
+/// A shader translated, with where the translation came from (the cache
+/// file, a fresh translation or a failure).
+pub fn shader_translated_event(
+    hash: &str,
+    stage: &str,
+    source: Option<TranslationSource>,
+    error: Option<&str>,
+    frame: u64,
+    duration_ms: Option<f64>,
+) {
+    if let Some(shared) = SHARED.get() {
+        shared.record_event_from(KIND_SHADER_TRANSLATED, hash, Some(stage), error, frame, duration_ms, source);
     }
 }
 

@@ -167,10 +167,14 @@ impl Shader {
                     KEPT[3].fetch_add(t.host.dxil.len() as u64, std::sync::atomic::Ordering::Relaxed);
                 }
                 if let Some(began) = began {
-                    victory_mcp::pipeline_event(
-                        victory_mcp::KIND_SHADER_TRANSLATED,
+                    let mut source = crate::shader_cache::take_source();
+                    if done.is_err() && source.is_none() {
+                        source = Some(victory_mcp::TranslationSource { how: "translation_failed", path: None, size: None, blake3: None });
+                    }
+                    victory_mcp::shader_translated_event(
                         &self.hash,
-                        Some(self.stage),
+                        self.stage,
+                        source,
                         done.as_ref().err().map(String::as_str),
                         crate::frame::current(),
                         Some(began.elapsed().as_secs_f64() * 1000.0),

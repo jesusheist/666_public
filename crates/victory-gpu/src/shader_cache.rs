@@ -22,6 +22,29 @@ static CACHE: OnceLock<Cache> = OnceLock::new();
 static HITS: AtomicU64 = AtomicU64::new(0);
 static MISSES: AtomicU64 = AtomicU64::new(0);
 
+thread_local! {
+    /// Where the last translation on this thread came from (`shader_history`).
+    static SOURCE: std::cell::RefCell<Option<victory_mcp::TranslationSource>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The source of the translation this thread made last, taken once.
+pub(crate) fn take_source() -> Option<victory_mcp::TranslationSource> {
+    SOURCE.with(|s| s.borrow_mut().take())
+}
+
+fn note_source(how: &'static str, path: Option<&std::path::Path>, bytes: Option<&[u8]>) {
+    if !victory_mcp::enabled() {
+        return;
+    }
+    let source = victory_mcp::TranslationSource {
+        how,
+        path: path.map(|p| p.display().to_string()),
+        size: bytes.map(|b| b.len() as u64),
+        blake3: bytes.map(|b| blake3::hash(b).to_hex().to_string()),
+    };
+    SOURCE.with(|s| *s.borrow_mut() = Some(source));
+}
+
 /// Keeps translated shaders in `dir` from now on.
 pub fn use_shader_cache(dir: PathBuf) {
     match Cache::open(dir) {
@@ -129,9 +152,14 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    SOURCE.with(|s| *s.borrow_mut() = None);
     match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate),
-        None => translate(container),
+        None => {
+            let done = translate(container);
+            note_source(if done.is_ok() { "translated_no_cache" } else { "translation_failed" }, None, None);
+            done
+        }
     }
 }
 
@@ -168,25 +196,40 @@ fn cached(
         translate,
         ran: AtomicBool::new(false),
     };
+    let mut retried = false;
     for _ in 0..2 {
-        let path = cache
-            .get_or_convert(&converter, &input)
-            .map_err(|e| format!("{e:#}"))?;
-        if let Some(shader) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
+        let path = match cache.get_or_convert(&converter, &input) {
+            Ok(path) => path,
+            Err(e) => {
+                note_source("translation_failed", None, None);
+                return Err(format!("{e:#}"));
+            }
+        };
+        let bytes = std::fs::read(&path).ok();
+        if let Some(shader) = bytes.as_deref().and_then(decode) {
             let (counter, what) = if converter.ran.load(Ordering::Relaxed) {
                 (&MISSES, "translated and cached")
             } else {
                 (&HITS, "from the cache")
             };
+            let how = match (converter.ran.load(Ordering::Relaxed), retried) {
+                (false, _) => "disk_cache_hit",
+                (true, false) => "fresh_translation_cached",
+                (true, true) => "retranslated_after_unreadable_cache_entry",
+            };
+            note_source(how, Some(&path), bytes.as_deref());
             counter.fetch_add(1, Ordering::Relaxed);
             tracing::debug!(path = %path.display(), "shader {what}");
             return Ok(shader);
         }
         tracing::debug!(path = %path.display(), "unreadable shader cache entry; translating again");
         let _ = std::fs::remove_file(&path);
+        retried = true;
     }
     MISSES.fetch_add(1, Ordering::Relaxed);
-    (converter.translate)(container)
+    let done = (converter.translate)(container);
+    note_source(if done.is_ok() { "retranslated_after_unreadable_cache_entry" } else { "translation_failed" }, None, None);
+    done
 }
 
 const MAGIC: &[u8; 4] = b"VSH1";

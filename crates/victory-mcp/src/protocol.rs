@@ -186,6 +186,30 @@ pub fn tools() -> Json {
             ]),
         ),
         tool(
+            "shader_history",
+            "Whole-run history of shaders",
+            "One summary per shader hash for the whole run (not only the newest events): the stages, the first and last frame it              was seen, how many pipelines bound it for the first time (and the first and last frame of that), and every recent              translation with its SOURCE: disk_cache_hit (read from the cache file: path, size in bytes and BLAKE3 of the file),              fresh_translation_cached (translated now and written to that file), translated_no_cache,              retranslated_after_unreadable_cache_entry or translation_failed (with the error). A hash that is not listed was never              seen by this process. Use frame_commands to see what a given frame runs.",
+            schema(vec![
+                (
+                    "hashes",
+                    Json::obj([
+                        ("type", Json::str("array")),
+                        ("items", Json::obj([("type", Json::str("string"))])),
+                        ("description", Json::str("Only hashes that contain one of these texts (case-insensitive). Default: all.")),
+                    ]),
+                ),
+                (
+                    "kind",
+                    Json::obj([
+                        ("type", Json::str("string")),
+                        ("enum", Json::Arr(KINDS.iter().map(|k| Json::str(*k)).collect())),
+                        ("description", Json::str("Only shaders that had an event of this kind.")),
+                    ]),
+                ),
+                ("n", count_schema("How many shaders at most (default 200, up to 2000).")),
+            ]),
+        ),
+        tool(
             "get_device_lost_report",
             "Device-lost report",
             "The full text of the report written when the host D3D12 device was lost (what the submitting thread was doing and the \
@@ -759,6 +783,7 @@ fn call(shared: &Shared, params: Option<&Json>) -> Result<Json, RpcError> {
         "get_stats" => Ok(stats(shared)),
         "get_recent_log" => recent_log(shared, args),
         "get_pipeline_events" => pipeline_events(shared, args),
+        "shader_history" => shader_history(shared, args),
         "get_device_lost_report" => Ok(device_lost(shared)),
         "screenshot" => screenshot(shared, args),
         "get_memory" => memory_tool(|h| (h.memory)()),
@@ -988,6 +1013,8 @@ fn pipeline_events(shared: &Shared, args: &Json) -> Result<Json, ToolError> {
                             ("hash", Json::str(e.hash.as_str())),
                             ("stage", opt(&e.stage)),
                             ("detail", opt(&e.detail)),
+                            ("source", e.source.as_ref().map_or(Json::Null, |x| Json::str(x.how))),
+                            ("cache_file", e.source.as_ref().and_then(|x| x.path.as_deref()).map_or(Json::Null, Json::str)),
                             ("frame", Json::uint(e.frame)),
                             ("at_ms", Json::num(e.at_ms)),
                             ("duration_ms", e.duration_ms.map_or(Json::Null, Json::num)),
@@ -996,6 +1023,51 @@ fn pipeline_events(shared: &Shared, args: &Json) -> Result<Json, ToolError> {
                     .collect(),
             ),
         ),
+    ]))
+}
+
+/// The strings of an optional array argument.
+fn string_list(args: &Json, key: &str) -> Result<Vec<String>, ToolError> {
+    match args.get(key) {
+        None | Some(Json::Null) => Ok(Vec::new()),
+        Some(Json::Arr(items)) => {
+            if items.len() > 1000 {
+                return Err(ToolError::Args(format!("{key} holds at most 1000 entries")));
+            }
+            items
+                .iter()
+                .map(|i| match i {
+                    Json::Str(s) => Ok(s.clone()),
+                    _ => Err(ToolError::Args(format!("{key} must be an array of strings"))),
+                })
+                .collect()
+        }
+        Some(_) => Err(ToolError::Args(format!("{key} must be an array of strings"))),
+    }
+}
+
+fn shader_history(shared: &Shared, args: &Json) -> Result<Json, ToolError> {
+    let n = count(args)?;
+    let hashes = string_list(args, "hashes")?;
+    let kind = optional_str(args, "kind")?;
+    if let Some(k) = kind
+        && !KINDS.contains(&k)
+    {
+        return Err(ToolError::Args(format!("kind must be one of {}", KINDS.join(", "))));
+    }
+    let (found, kept, not_kept) = shared.history.query(&hashes, kind, n);
+    let missing: Vec<Json> = hashes
+        .iter()
+        .filter(|w| !found.iter().any(|(h, _)| h.to_ascii_lowercase().contains(&w.to_ascii_lowercase())))
+        .map(|w| Json::str(w.as_str()))
+        .collect();
+    Ok(Json::obj([
+        ("returned", Json::uint(found.len() as u64)),
+        ("hashes_kept", Json::uint(kept as u64)),
+        ("hashes_not_kept_over_limit", Json::uint(not_kept)),
+        ("events_recorded_total", Json::uint(shared.events.total())),
+        ("asked_but_never_seen", Json::Arr(missing)),
+        ("shaders", Json::Arr(found.iter().map(|(h, s)| crate::history::summary_json(h, s)).collect())),
     ]))
 }
 
@@ -1164,7 +1236,7 @@ mod tests {
         let names: Vec<_> = tools.iter().filter_map(|t| t.get("name").and_then(Json::as_str)).collect();
         assert_eq!(
             names,
-            ["get_stats", "get_recent_log", "get_pipeline_events", "get_device_lost_report", "screenshot", "get_memory", "get_dropped_draws", "get_settings", "set_setting", "list_tunables", "get_tunable", "set_tunable", "reset_tunable", "cheat", "press", "stick", "release_all", "input_script", "find_bad_pixels", "mem_regions", "mem_scan_start", "mem_scan_filter", "mem_scan_list", "mem_read", "mem_scan_reset", "mem_watch_writes", "code_read"]
+            ["get_stats", "get_recent_log", "get_pipeline_events", "shader_history", "get_device_lost_report", "screenshot", "get_memory", "get_dropped_draws", "get_settings", "set_setting", "list_tunables", "get_tunable", "set_tunable", "reset_tunable", "cheat", "press", "stick", "release_all", "input_script", "find_bad_pixels", "mem_regions", "mem_scan_start", "mem_scan_filter", "mem_scan_list", "mem_read", "mem_scan_reset", "mem_watch_writes", "code_read"]
         );
         for t in tools {
             let schema = t.get("inputSchema").unwrap();
