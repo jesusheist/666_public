@@ -722,12 +722,35 @@ fn env_text(slot: &Slot) -> Option<String> {
     if bits == slot.meta.default {
         return None;
     }
-    Some(match slot.meta.kind {
+    Some(env_value(&slot.meta, bits))
+}
+
+/// The text of the environment variable for stored bits.
+fn env_value(meta: &Meta, bits: u64) -> String {
+    match meta.kind {
         Kind::Bool => if bits != 0 { "1" } else { "0" }.to_owned(),
         Kind::Int { .. } => (bits as i64).to_string(),
         Kind::Float { .. } => f64::from_bits(bits).to_string(),
         Kind::Choice(list) => list.get(bits as usize).copied().unwrap_or("").to_owned(),
-    })
+    }
+}
+
+/// What the live file holds for the registered switches, as the text each
+/// one's environment variable takes (a value equal to the default too). A
+/// launcher that sets its own presets in the environment puts these over
+/// them, so a value saved by the menu or the debug server is not lost under a
+/// preset; what the user passes on the command line still goes over these.
+pub fn saved_env_values() -> Vec<(&'static str, String)> {
+    known_once();
+    let mut out = Vec::new();
+    for slot in all() {
+        if let Some(text) = file_value(&slot.key())
+            && let Ok(bits) = parse(&slot.meta, &text, false)
+        {
+            out.push((slot.meta.env, env_value(&slot.meta, bits)));
+        }
+    }
+    out
 }
 
 /// The core of [`export_env_read`]: for each slot whose value is not the
@@ -1201,6 +1224,24 @@ mod tests {
         assert_eq!(reset("t_file"), Ok(Outcome::Applied));
         assert_eq!(T_FILE.get(), 1);
         assert!(!parse_section(&std::fs::read_to_string(&path).unwrap()).contains_key("t_file"));
+        set_live_path(None);
+    }
+
+    #[test]
+    fn saved_values_come_out_as_environment_text_defaults_included() {
+        let _g = serial();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("victory-live.toml"), "[tunables]
+fps_line = false
+relay = \"1\"
+panel = false
+").unwrap();
+        set_live_path(Some(dir.path().join("victory-live.toml")));
+        let got = saved_env_values();
+        assert!(got.contains(&("VICTORY_FPS_LINE", "0".to_owned())), "{got:?}");
+        assert!(got.contains(&("VICTORY_RELAY", "1".to_owned())), "{got:?}");
+        assert!(got.contains(&("VICTORY_PANEL", "0".to_owned())), "a default is still given: {got:?}");
+        assert!(!got.iter().any(|(k, _)| *k == "VICTORY_CARD_STEPS"));
         set_live_path(None);
     }
 
