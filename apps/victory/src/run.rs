@@ -370,6 +370,9 @@ pub fn run(
     victory_hle::runtime::set_title_dll_loader(Box::new(move |file| {
         late.load(file, show).map_err(|e| format!("{e:#}"))
     }));
+    // Host DLLs named in VICTORY_LOAD_DLLS (ScriptHook VI) are told about the mapped title before any title
+    // code runs, after our own call-site hooks above are in place.
+    load_host_dlls(image.base(), image.info().size_of_image as u64, exe);
     // SAFETY: imports are bound; from here on we run title code.
     let main = unsafe { Arc::new(image).spawn_main(dlls)? };
     let code = main
@@ -754,4 +757,64 @@ mod cpu_check_tests {
 #[cfg(not(windows))]
 pub fn run(_: &Path, _: Unimplemented, _: bool, _: bool, _: Console) -> Result<()> {
     anyhow::bail!("running titles requires Windows")
+}
+
+/// Local edit (not upstream): `VICTORY_LOAD_DLLS=<path>;<path>` loads each host DLL and calls its
+/// `victory_on_title_mapped(&TitleInfo)` export, if it has one. A DLL that fails to load, has no such
+/// export or returns nonzero is logged and skipped; the title runs on.
+#[cfg(windows)]
+fn load_host_dlls(base: usize, size: u64, exe: &Path) {
+    use std::os::windows::ffi::OsStrExt;
+
+    #[repr(C)]
+    struct TitleInfo {
+        struct_size: u32,
+        version: u32,
+        image_base: *mut core::ffi::c_void,
+        image_size: u64,
+        exe_path: *const u16,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn LoadLibraryW(name: *const u16) -> *mut core::ffi::c_void;
+        fn GetProcAddress(module: *mut core::ffi::c_void, name: *const u8) -> *mut core::ffi::c_void;
+    }
+    let Ok(list) = std::env::var("VICTORY_LOAD_DLLS") else {
+        return;
+    };
+    let wide = |s: &std::ffi::OsStr| -> Vec<u16> { s.encode_wide().chain(Some(0)).collect() };
+    // Kept for the whole run: the DLL may hold on to the path.
+    // VICTORY_SHVI_HOME=<folder>: host DLLs are told the title lives there (<folder>\<exe file name>, a hard link to
+    // the real exe), so they keep their own files (ScriptHook VI's `shvi` folder) out of the game folder.
+    let told = match std::env::var_os("VICTORY_SHVI_HOME") {
+        Some(home) if !home.is_empty() => Path::new(&home).join(exe.file_name().unwrap_or_default()),
+        _ => exe.to_path_buf(),
+    };
+    let exe_w: &'static [u16] = Vec::leak(wide(told.as_os_str()));
+    for path in list.split(';').map(str::trim).filter(|p| !p.is_empty()) {
+        let path_w = wide(std::ffi::OsStr::new(path));
+        // SAFETY: a NUL-terminated path; the module stays loaded for the run.
+        let module = unsafe { LoadLibraryW(path_w.as_ptr()) };
+        if module.is_null() {
+            eprintln!("VIctory: host dll {path}: not loaded ({})", std::io::Error::last_os_error());
+            continue;
+        }
+        // SAFETY: a NUL-terminated name and a loaded module.
+        let entry = unsafe { GetProcAddress(module, c"victory_on_title_mapped".as_ptr().cast()) };
+        if entry.is_null() {
+            eprintln!("VIctory: host dll {path}: loaded, no victory_on_title_mapped export");
+            continue;
+        }
+        let info = TitleInfo {
+            struct_size: size_of::<TitleInfo>() as u32,
+            version: 1,
+            image_base: base as *mut _,
+            image_size: size,
+            exe_path: exe_w.as_ptr(),
+        };
+        // SAFETY: the export's documented signature; `info` outlives the call.
+        let entry: unsafe extern "C" fn(*const TitleInfo) -> i32 = unsafe { std::mem::transmute(entry) };
+        let rc = unsafe { entry(&info) };
+        eprintln!("VIctory: host dll {path}: victory_on_title_mapped returned {rc}");
+    }
 }
