@@ -2633,7 +2633,7 @@ mod tests {
         hub.poll();
         let r = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
         let p = pad(r);
-        assert_eq!((p.buttons, p.left_y, p.right_trigger), (X, 1.0, 1.0));
+        assert_eq!((p.buttons, p.left_y, p.right_trigger), (A, 1.0, 1.0));
         release(r);
         // The keyboard device still has its keys.
         let r = current(hub, KEYBOARD_KIND, KEYBOARD).unwrap();
@@ -2726,7 +2726,7 @@ mod tests {
         let p = pad(r);
         assert_eq!(
             (p.buttons, p.left_x, p.left_trigger),
-            (B | X, 1.0, 1.0),
+            (B | A, 1.0, 1.0),
             "pad and keyboard together"
         );
         release(r);
