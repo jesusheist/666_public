@@ -475,6 +475,18 @@ pub fn tools() -> Json {
             ]),
         ),
         tool(
+            "renderdoc_capture",
+            "Capture one frame with RenderDoc",
+            "Triggers a RenderDoc capture of the next presented frame through its in-application API and returns the .rdc path, \
+             to open in RenderDoc (or a tool that reads .rdc files). Works only when renderdoc.dll is in the game process before the \
+             D3D12 device is made: start the game from RenderDoc, or set VICTORY_RENDERDOC=<full path to renderdoc.dll> before it starts \
+             (it is then loaded first). Otherwise answers with that instruction. Waits up to 60 s.",
+            schema(vec![(
+                "folder",
+                Json::obj([("type", Json::str("string")), ("description", Json::str("Folder for the capture file (default: RenderDoc's own)."))]),
+            )]),
+        ),
+        tool(
             "mem_regions",
             "Title memory ranges",
             "The title's committed, readable and writable memory ranges (what a memory scan covers): base, end, size, protection and kind \
@@ -865,6 +877,7 @@ fn call(shared: &Shared, params: Option<&Json>) -> Result<Json, RpcError> {
         "cheat" => cheat_tool(args),
         "find_bad_pixels" => find_bad_pixels(shared, args),
         "frame_commands" => frame_commands(shared, args),
+        "renderdoc_capture" => renderdoc_tool(args),
         "trace_pixel" => trace_pixel(shared, args),
         "dump_target" => dump_target(shared, args),
         "mem_regions" => mem_regions_tool(args),
@@ -1194,6 +1207,14 @@ fn scan_params(args: &Json) -> Result<ScanParams, ToolError> {
     Ok(params)
 }
 
+fn renderdoc_tool(args: &Json) -> Result<Json, ToolError> {
+    let folder = optional_str(args, "folder")?.filter(|f| !f.is_empty());
+    match crate::renderdoc_hook() {
+        None => Err(ToolError::Failed("RenderDoc is not loaded in this process: start the game from RenderDoc, or set VICTORY_RENDERDOC=<full path to renderdoc.dll> before it starts".into())),
+        Some(hook) => hook(std::time::Duration::from_secs(60), folder).map(|path| Json::obj([("capture", Json::str(path))])).map_err(ToolError::Failed),
+    }
+}
+
 fn max_draws_schema(what: &str) -> Json {
     Json::obj([
         ("type", Json::str("integer")),
@@ -1404,7 +1425,7 @@ mod tests {
         let names: Vec<_> = tools.iter().filter_map(|t| t.get("name").and_then(Json::as_str)).collect();
         assert_eq!(
             names,
-            ["get_stats", "get_recent_log", "get_pipeline_events", "shader_history", "get_device_lost_report", "screenshot", "get_memory", "get_dropped_draws", "get_settings", "set_setting", "list_tunables", "get_tunable", "set_tunable", "reset_tunable", "cheat", "press", "stick", "release_all", "input_script", "find_bad_pixels", "frame_commands", "trace_pixel", "dump_target", "mem_regions", "mem_scan_start", "mem_scan_filter", "mem_scan_list", "mem_read", "mem_scan_reset", "mem_watch_writes", "code_read"]
+            ["get_stats", "get_recent_log", "get_pipeline_events", "shader_history", "get_device_lost_report", "screenshot", "get_memory", "get_dropped_draws", "get_settings", "set_setting", "list_tunables", "get_tunable", "set_tunable", "reset_tunable", "cheat", "press", "stick", "release_all", "input_script", "find_bad_pixels", "frame_commands", "trace_pixel", "dump_target", "renderdoc_capture", "mem_regions", "mem_scan_start", "mem_scan_filter", "mem_scan_list", "mem_read", "mem_scan_reset", "mem_watch_writes", "code_read"]
         );
         for t in tools {
             let schema = t.get("inputSchema").unwrap();

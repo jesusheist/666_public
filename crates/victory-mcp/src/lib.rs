@@ -138,6 +138,22 @@ pub fn set_drops_hook(hook: fn() -> Json) {
     let _ = DROPS_HOOK.set(hook);
 }
 
+/// What `renderdoc_capture` calls: how long to wait for the capture, and a
+/// folder for the file (default: RenderDoc's own); the file's path or why not.
+pub type RenderdocHook = fn(Duration, Option<&str>) -> Result<String, String>;
+
+static RENDERDOC_HOOK: OnceLock<RenderdocHook> = OnceLock::new();
+
+/// Registers the function behind `renderdoc_capture` (the runtime does it
+/// when RenderDoc is in the process). The first call wins.
+pub fn set_renderdoc_hook(hook: RenderdocHook) {
+    let _ = RENDERDOC_HOOK.set(hook);
+}
+
+pub(crate) fn renderdoc_hook() -> Option<RenderdocHook> {
+    RENDERDOC_HOOK.get().copied()
+}
+
 pub(crate) fn drops_hook() -> Option<fn() -> Json> {
     DROPS_HOOK.get().copied()
 }

@@ -46,6 +46,8 @@ mod host;
 #[cfg(windows)]
 mod badpix;
 #[cfg(windows)]
+mod renderdoc;
+#[cfg(windows)]
 mod logstats;
 #[cfg(windows)]
 mod mcp_shot;
