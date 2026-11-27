@@ -703,6 +703,7 @@ pub fn init() {
     ONCE.call_once(|| {
         known_once();
         victory_mcp::set_tunable_hooks(victory_mcp::TunableHooks { list: list_json, get: get_json, set: set_json, reset: reset_json });
+        crate::cheats::register_mcp();
         export_env_read();
         start_watcher();
     });

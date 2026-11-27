@@ -44,6 +44,14 @@ pub fn drain(mut run: impl FnMut(u8)) {
     }
 }
 
+/// Gives the debug server its `cheat` tool.
+pub(crate) fn register_mcp() {
+    victory_mcp::set_cheat_hook(|n| {
+        queue(n).map_err(str::to_owned)?;
+        Ok(victory_mcp::Json::obj([("queued", victory_mcp::Json::Int(i64::from(n)))]))
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

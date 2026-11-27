@@ -181,6 +181,9 @@ pub extern "system" fn XMemVirtualAlloc(
             "XMemVirtualAlloc"
         );
     }
+    if !at.is_null() {
+        crate::memscan::note_allocated(at as usize, size);
+    }
     if !at.is_null() && !placeholder {
         victory_gpu::title_memory_allocated(at as usize, size);
     }
@@ -376,7 +379,9 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
-            VirtualFree(address, 0, MEM_RELEASE);
+            if VirtualFree(address, 0, MEM_RELEASE) != 0 {
+                crate::memscan::note_released(address as usize, 0);
+            }
             return;
         }
         let user = address.cast::<u8>();
@@ -2757,7 +2762,11 @@ extern "system" fn title_virtual_free(address: *mut c_void, size: usize, kind: u
         victory_gpu::title_memory_freed(address as usize, size);
     }
     // SAFETY: the title's own arguments.
-    unsafe { VirtualFree(address, size, kind) }
+    let freed = unsafe { VirtualFree(address, size, kind) };
+    if freed != 0 && kind & MEM_RELEASE != 0 && kind & MEM_PRESERVE_PLACEHOLDER == 0 {
+        crate::memscan::note_released(address as usize, size);
+    }
+    freed
 }
 
 /// The title's own `VirtualQuery`, while views are kept in the books alone

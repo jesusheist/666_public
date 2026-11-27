@@ -11,6 +11,9 @@ static MAIN_IMAGE_BASE: AtomicUsize = AtomicUsize::new(0);
 pub fn set_main_image(base: usize) {
     MAIN_IMAGE_BASE.store(base, Ordering::Release);
     crate::image_watch::start(base);
+    // The debug server's memory tools (VICTORY_MCP).
+    #[cfg(windows)]
+    crate::memscan::init();
 }
 
 pub fn main_image() -> Option<usize> {

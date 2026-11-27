@@ -376,6 +376,25 @@ pub(crate) unsafe fn put_changed(dst: *mut u8, was: &[u8], now: &[u8]) -> bool {
     all
 }
 
+/// Reads `out.len()` bytes of title memory at `at` into `out` (for the debug
+/// tools): false if a page of it cannot be read, and then some of `out` may
+/// have been filled. Never faults, never writes title memory.
+pub fn read_title(at: usize, out: &mut [u8]) -> bool {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    if out.is_empty() {
+        return true;
+    }
+    if on() {
+        // SAFETY: the destination is our own slice; a source page that is
+        // not there fails the copy (the handler of `watch`).
+        return unsafe { copy(out.as_mut_ptr(), at as *const u8, out.len()) };
+    }
+    let mut done = 0;
+    // SAFETY: the destination is our own slice; the kernel checks the source.
+    unsafe { ReadProcessMemory(GetCurrentProcess(), at as *const _, out.as_mut_ptr().cast(), out.len(), &mut done) != 0 }
+}
+
 /// Whether copies are made here and not by the kernel.
 pub(crate) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();

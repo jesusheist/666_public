@@ -521,6 +521,17 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
                 let bytes = blob.bytes().len();
                 BLOB.store(bytes as u64, Ordering::Relaxed);
                 tracing::info!(bytes, mapped = matches!(blob, Blob::Mapped(_)), "host pipeline library loaded");
+                if victory_mcp::enabled() {
+                    let detail = format!("{bytes} bytes, mapped: {}", matches!(blob, Blob::Mapped(_)));
+                    victory_mcp::pipeline_event(
+                        victory_mcp::KIND_LIBRARY_LOADED,
+                        "library",
+                        None,
+                        Some(&detail),
+                        crate::frame::current(),
+                        None,
+                    );
+                }
                 if let Blob::Mapped(file) = &blob {
                     VIEW[1].store(file.len, Ordering::Relaxed);
                     VIEW[0].store(file.at.Value as usize, Ordering::Relaxed);
@@ -561,6 +572,22 @@ pub(crate) fn name(kind: &str, root: &[u8], code: &[&[u8]], state: &str) -> Stri
     h.finalize().to_hex()[..32].to_owned()
 }
 
+/// Tells the debug server (`VICTORY_MCP`) a pipeline was loaded from the
+/// library or made (`kind`), and how long it took since `began`.
+fn event(kind: &'static str, name: &str, began: std::time::Instant) {
+    if victory_mcp::enabled() {
+        let label = LABEL.with(|l| l.borrow().clone());
+        victory_mcp::pipeline_event(
+            kind,
+            name,
+            None,
+            Some(&label),
+            crate::frame::current(),
+            Some(began.elapsed().as_secs_f64() * 1e3),
+        );
+    }
+}
+
 /// The pipeline named `name`: loaded from the library by `load` if it is
 /// there with the same description, else made by `create` and stored.
 pub(crate) fn pipeline(
@@ -590,6 +617,7 @@ pub(crate) fn pipeline(
                 let label = LABEL.with(|l| l.borrow().clone());
                 format!("pipeline library: loaded {label} in {:.1} ms", began.elapsed().as_secs_f64() * 1e3)
             });
+            event(victory_mcp::KIND_PIPELINE_LOADED, name, began);
             return Ok(pso);
         }
         Err(e) => e,
@@ -600,6 +628,7 @@ pub(crate) fn pipeline(
         create()?
     };
     MADE.fetch_add(1, Ordering::Relaxed);
+    event(victory_mcp::KIND_PIPELINE_MADE, name, began);
     crate::host::trail(|| {
         let label = LABEL.with(|l| l.borrow().clone());
         format!(

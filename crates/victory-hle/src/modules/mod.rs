@@ -22,6 +22,7 @@ pub mod fidelityfx;
 pub mod files;
 pub mod controls;
 pub mod gameinput;
+pub mod remote_pad;
 pub mod kernel;
 #[cfg(windows)]
 pub mod lifecycle;

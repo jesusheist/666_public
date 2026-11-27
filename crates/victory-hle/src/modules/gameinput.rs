@@ -527,6 +527,10 @@ impl Hub {
             if let Some(scripted) = source.diagnostic_pad() {
                 pads[0] = Some(pads[0].map_or(scripted, |host| merged(host, scripted)));
             }
+            // The pad pressed through the debug MCP server (no focus needed).
+            if let Some(remote) = super::remote_pad::read() {
+                pads[0] = Some(pads[0].map_or(remote, |host| merged(host, remote)));
+            }
             (pads, source.keys(), source.mouse(), source.mouse_buttons())
         };
         let events = {

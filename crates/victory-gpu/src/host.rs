@@ -622,6 +622,8 @@ pub(crate) fn removal_context() -> String {
 /// Says [`removal_context`] in the log, once: called by whoever finds the
 /// host device removed.
 pub(crate) fn log_removal_context() {
+    // The per-subject log files (VICTORY_LOG_DIR): the last perf and memory numbers, flushed.
+    victory_core::logging::device_removed();
     static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if !(trail_on() || dred_any()) || SAID.swap(true, Ordering::Relaxed) {
         return;
@@ -854,6 +856,11 @@ pub(crate) fn host() -> Option<&'static Host> {
 }
 
 fn create() -> windows::core::Result<Host> {
+    // The frame number each line of the log files carries.
+    victory_core::logging::set_frame_source(crate::frame::current);
+    if victory_mcp::enabled() {
+        crate::logstats::register_mcp();
+    }
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {
         // The debug layer only in builds with diagnostics.
@@ -9273,6 +9280,8 @@ struct Meter {
     #[cfg(feature = "diagnostics")]
     copy_stats_frames: u64,
     drawn: u64,
+    /// Submissions begun by the last frame-rate line.
+    submissions: u64,
     logged: std::time::Instant,
 }
 
@@ -9285,6 +9294,7 @@ impl Meter {
             #[cfg(feature = "diagnostics")]
             copy_stats_frames: 0,
             drawn: crate::draw::drawn(),
+            submissions: STARTED.load(Ordering::Relaxed),
             logged: now,
         }
     }
@@ -9330,7 +9340,42 @@ impl Meter {
         let dropped = crate::draw::take_dropped() as f64 / frames;
         let indirect = crate::list::take_indirect() as f64 / frames;
         let left_out = crate::pipeline::take_left_out() as f64 / frames;
-        let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
+        let submissions = {
+            let started = STARTED.load(Ordering::Relaxed);
+            started.saturating_sub(std::mem::replace(&mut self.submissions, started)) as f64 / frames
+        };
+        // The per-subject log files (VICTORY_LOG_DIR): perf and memory lines every 5 s.
+        victory_core::logging::publish_perf(victory_core::logging::PerfSample {
+            fps,
+            ms_per_frame: ms,
+            draws_per_frame: draws,
+            dropped_per_frame: dropped,
+            submissions_per_frame: submissions,
+            preparing_ms: cpu,
+        });
+        crate::logstats::tick();
+        // The debug server (VICTORY_MCP) is given the values of this line.
+        if victory_mcp::enabled() {
+            victory_mcp::publish_stats(victory_mcp::Stats {
+                frame: crate::frame::current(),
+                frames: frames as u32,
+                fps,
+                ms_per_frame: ms,
+                preparing_ms: cpu,
+                copies_ms: copy_ms,
+                copies_mb: copy_mb,
+                textures_ms: texture_ms,
+                textures_mb: texture_mb,
+                gpu_ms: gpu,
+                copy_back_ms: back_ms,
+                copy_back_mb: back_mb,
+                draws_per_frame: draws,
+                dropped_per_frame: dropped,
+                indirect_per_frame: indirect,
+                submissions_per_frame: submissions,
+            });
+        }
+        let mesh_largest =MESH_GROUPS[0].swap(0, Ordering::Relaxed);
         let mesh_groups = MESH_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
         let refused = BUDGET_NOTES[0].swap(0, Ordering::Relaxed) as f64 / frames;
         let biggest = BUDGET_NOTES[1].swap(0, Ordering::Relaxed);
@@ -9859,10 +9904,13 @@ impl Host {
             // Sent ahead ([`late_free_present`]) unless the frame is to be
             // read back at once (a saved or listed frame): then a list of
             // its own, one whose last flight has finished or a new one.
+            // The debug server's screenshot (VICTORY_MCP): one relaxed load a
+            // frame when none is asked for, and none at all when it is off.
+            let shot = victory_mcp::take_shot_request();
             #[cfg(feature = "diagnostics")]
-            let read_now = crate::capture::wanted(frame) || crate::capture::listed(frame);
+            let read_now = crate::capture::wanted(frame) || crate::capture::listed(frame) || shot.is_some();
             #[cfg(not(feature = "diagnostics"))]
-            let read_now = false;
+            let read_now = shot.is_some();
             let slot = if late_free_present() && !read_now {
                 let finished = FINISHED.load(Ordering::Acquire);
                 p.ahead.iter().position(|(_, flown)| *flown <= finished).or_else(|| {
@@ -9952,6 +10000,25 @@ impl Host {
                 list.ResourceBarrier(&pre);
                 list.CopyResource(&back, texture);
             }
+            // (the texture is in the copy-source state here unless two planes were composed;
+            // then the picture is the composed back buffer, left in the copy-destination state)
+            let shot = shot.and_then(|request| {
+                if composed {
+                    list.ResourceBarrier(&[transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                    )]);
+                    let pending = crate::mcp_shot::record(&self.device, list, &back, request);
+                    list.ResourceBarrier(&[transition(
+                        &back,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    )]);
+                    return pending;
+                }
+                crate::mcp_shot::record(&self.device, list, texture, request)
+            });
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
                 .then(|| {
@@ -10017,6 +10084,10 @@ impl Host {
                     0
                 }
             };
+            // The copy has run (a screenshot's present is never sent ahead).
+            if let Some(pending) = shot {
+                pending.deliver(frame);
+            }
             #[cfg(feature = "diagnostics")]
             if let Some(taken) = watched {
                 crate::popwatch::sent(taken, flown, frame);

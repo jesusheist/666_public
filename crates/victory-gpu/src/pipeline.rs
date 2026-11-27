@@ -148,6 +148,8 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
+                // Timed only for the debug server (VICTORY_MCP).
+                let began = victory_mcp::enabled().then(std::time::Instant::now);
                 let done = translate(&self.container);
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
@@ -163,6 +165,16 @@ impl Shader {
                 if let Ok(t) = &done {
                     KEPT[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     KEPT[3].fetch_add(t.host.dxil.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                }
+                if let Some(began) = began {
+                    victory_mcp::pipeline_event(
+                        victory_mcp::KIND_SHADER_TRANSLATED,
+                        &self.hash,
+                        Some(self.stage),
+                        done.as_ref().err().map(String::as_str),
+                        crate::frame::current(),
+                        Some(began.elapsed().as_secs_f64() * 1000.0),
+                    );
                 }
                 match &done {
                     Ok(t) => tracing::info!(
@@ -445,6 +457,9 @@ pub(crate) fn bound(this: This) {
     let frame = crate::frame::current();
     for shader in &p.shaders {
         tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.container.len(), hash = %shader.hash, "first bind");
+        if victory_mcp::enabled() {
+            victory_mcp::pipeline_event(victory_mcp::KIND_FIRST_BIND, &shader.hash, Some(shader.stage), None, frame, None);
+        }
     }
 }
 

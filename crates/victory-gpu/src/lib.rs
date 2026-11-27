@@ -44,6 +44,10 @@ mod heap_marks;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
+mod logstats;
+#[cfg(windows)]
+mod mcp_shot;
+#[cfg(windows)]
 pub use host::menu_key_down;
 /// The F1 settings menu is shown (`host/menu.rs`): the title gets no keyboard meanwhile
 /// (read by the input module).
@@ -127,6 +131,8 @@ pub fn frame_phase() -> u32 {
 pub fn frames_begun() -> u64 {
     frame::current()
 }
+#[cfg(windows)]
+pub use safecopy::read_title as read_title_memory;
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_section_gone, title_memory_view};
 #[cfg(windows)]
