@@ -45,7 +45,7 @@ scanner and checked over two launches. Format: `<hex address | img+hex offset>[:
 | C | Crouch | Look behind |
 | E | | Horn |
 | H | | Headlights |
-| F | Get in | Get out |
+| F | Interact: doors, prompts, get in (the layout follows the flag) | Get out |
 | G | Switch layout by hand | Switch layout by hand |
 | R | Melee | Melee |
 | Q | Cover | |

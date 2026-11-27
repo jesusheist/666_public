@@ -1310,6 +1310,10 @@ impl Controls {
         for out in outs {
             match *out {
                 Output::ToggleVehicle => self.vehicle = !self.vehicle,
+                // With the title's vehicle flag in use, EnterVehicle and ExitVehicle are the title's
+                // own interact button (Y) and nothing more: doors and other prompts no longer flip
+                // the layout; the flag does. G (ToggleVehicle) still switches by hand.
+                Output::SetVehicle(_) if self.flag.is_some() => continue,
                 Output::SetVehicle(v) => self.vehicle = v,
                 Output::ReleaseCursor => {
                     self.toggle_capture = true;
@@ -2210,6 +2214,31 @@ mod tests {
         d.follow_flag(|_| Some(1));
         assert!(!d.in_vehicle());
         d.follow_flag(|_| Some(2));
+        assert!(d.in_vehicle());
+    }
+
+    #[test]
+    fn with_the_flag_f_is_only_interact_and_does_not_switch_the_layout() {
+        // feed_at, not held: held reads the flag from real memory.
+        let at = |c: &mut Controls, keys: &[&str], now: u64| {
+            let keys: Vec<u8> = keys.iter().map(|k| vk(k)).collect();
+            c.feed_at(&keys, &Counts::default(), now);
+            c.peek(None)
+        };
+        let mut c = controls();
+        c.flag = Some(flag("10"));
+        let pad = at(&mut c, &["F"], 0);
+        assert!(pad.buttons & Y != 0, "F still presses Y (interact, doors, get in)");
+        at(&mut c, &[], 50);
+        assert!(!c.in_vehicle(), "F does not flip the layout while the flag decides");
+        // G still switches by hand.
+        at(&mut c, &["G"], 100);
+        at(&mut c, &[], 150);
+        assert!(c.in_vehicle());
+        // Without the flag F switches as before.
+        let mut d = controls();
+        at(&mut d, &["F"], 0);
+        at(&mut d, &[], 50);
         assert!(d.in_vehicle());
     }
 
