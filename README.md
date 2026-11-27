@@ -5,8 +5,9 @@
 - [`kb`](../../tree/kb): keyboard and mouse (automatic vehicle layout, key prompts, remote pad).
 - [`hotswap`](../../tree/hotswap): live settings, then soft reload and swapping code while the game runs.
 - [`texture-pool`](../../tree/texture-pool): the texture pool, eviction and the memory budget.
+- [`mcp`](../../tree/mcp): the MCP server, to drive and inspect the running game from outside.
 
-All four start from the same commit; each branch moves on with its own work.
+All five start from the same commit; each branch moves on with its own work.
 
 A fork of the VIctory runtime (by way of cool_fox) that plays the Xbox Series build
 of the title on a Windows PC. The focus here is playing it with a keyboard and
