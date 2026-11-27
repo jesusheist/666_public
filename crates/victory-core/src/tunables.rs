@@ -702,6 +702,12 @@ pub fn init() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         known_once();
+        // A launcher fills the environment after the registry may have been
+        // looked at (it reads the saved values to build it): read it all again.
+        lock(&STATE).loaded = false;
+        for slot in list_registered() {
+            slot.reinit();
+        }
         victory_mcp::set_tunable_hooks(victory_mcp::TunableHooks { list: list_json, get: get_json, set: set_json, reset: reset_json });
         crate::cheats::register_mcp();
         export_env_read();
@@ -735,22 +741,33 @@ fn env_value(meta: &Meta, bits: u64) -> String {
     }
 }
 
-/// What the live file holds for the registered switches, as the text each
-/// one's environment variable takes (a value equal to the default too). A
-/// launcher that sets its own presets in the environment puts these over
-/// them, so a value saved by the menu or the debug server is not lost under a
-/// preset; what the user passes on the command line still goes over these.
-pub fn saved_env_values() -> Vec<(&'static str, String)> {
+/// What the live file holds for the registered switches, for a launcher that
+/// sets its own presets in the environment: the variable and `Some(text)` to
+/// put over the preset, or `None` where the saved value is the default (the
+/// variable is then left out, which every reader takes as the default; a
+/// default is never written as text, because some readers take any set value,
+/// "0" too, as on). Only values the file holds, that is, saved on purpose.
+pub fn saved_env_values() -> Vec<(&'static str, Option<String>)> {
     known_once();
     let mut out = Vec::new();
     for slot in all() {
         if let Some(text) = file_value(&slot.key())
             && let Ok(bits) = parse(&slot.meta, &text, false)
         {
-            out.push((slot.meta.env, env_value(&slot.meta, bits)));
+            out.push((slot.meta.env, (bits != slot.meta.default).then(|| env_value(&slot.meta, bits))));
         }
     }
     out
+}
+
+impl Slot {
+    /// Reads the start value again from the environment and the file (the
+    /// environment may have been filled since the slot was first read).
+    fn reinit(&'static self) {
+        self.env_locked.store(false, Relaxed);
+        self.has_pending.store(false, Relaxed);
+        self.init_inner(&|n| std::env::var(n).ok(), &file_value);
+    }
 }
 
 /// The core of [`export_env_read`]: for each slot whose value is not the
@@ -1228,7 +1245,7 @@ mod tests {
     }
 
     #[test]
-    fn saved_values_come_out_as_environment_text_defaults_included() {
+    fn saved_values_come_out_as_environment_text_and_defaults_as_unset() {
         let _g = serial();
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("victory-live.toml"), "[tunables]
@@ -1238,9 +1255,9 @@ panel = false
 ").unwrap();
         set_live_path(Some(dir.path().join("victory-live.toml")));
         let got = saved_env_values();
-        assert!(got.contains(&("VICTORY_FPS_LINE", "0".to_owned())), "{got:?}");
-        assert!(got.contains(&("VICTORY_RELAY", "1".to_owned())), "{got:?}");
-        assert!(got.contains(&("VICTORY_PANEL", "0".to_owned())), "a default is still given: {got:?}");
+        assert!(got.contains(&("VICTORY_FPS_LINE", Some("0".to_owned()))), "{got:?}");
+        assert!(got.contains(&("VICTORY_RELAY", Some("1".to_owned()))), "{got:?}");
+        assert!(got.contains(&("VICTORY_PANEL", None)), "a default is left out, never given as text: {got:?}");
         assert!(!got.iter().any(|(k, _)| *k == "VICTORY_CARD_STEPS"));
         set_live_path(None);
     }

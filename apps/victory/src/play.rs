@@ -220,7 +220,10 @@ fn settings(o: &Play, menu: &[(String, String)], streamline: Option<&Path>) -> (
     set("VICTORY_FRAME_INTERVAL_US", &(1_000_000.0 / f64::from(fps)).round().to_string());
     // What was saved in the live settings file goes over the presets above.
     for (k, v) in victory_core::tunables::saved_env_values() {
-        s.insert(k.to_owned(), v);
+        match v {
+            Some(v) => drop(s.insert(k.to_owned(), v)),
+            None => drop(s.remove(k)),
+        }
     }
     for (k, v) in menu.iter().filter(|(k, _)| !k.starts_with("VICTORY_MENU_")) {
         if v.is_empty() {
