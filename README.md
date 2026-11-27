@@ -1,5 +1,10 @@
 # 666
 
+**Branch `kb`**: keyboard and mouse. Work here goes into the PC layout
+(`[controls]`), the automatic vehicle layout (`VICTORY_VEHICLE_FLAG`), the key prompts
+(`VICTORY_PROMPTS=keys`) and the remote pad. Next: the aircraft and boat layouts found the same way
+as the car flag, and key prompts that follow the layout when it changes.
+
 A fork of the VIctory runtime (by way of cool_fox) that plays the Xbox Series build
 of the title on a Windows PC. The focus here is playing it with a keyboard and
 mouse, plus tools to find what the title keeps in memory.
