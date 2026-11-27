@@ -655,7 +655,9 @@ dependencies = [
  "tempfile",
  "thiserror",
  "toml",
+ "tracing",
  "tracing-subscriber",
+ "victory-mcp",
 ]
 
 [[package]]
@@ -721,6 +723,17 @@ dependencies = [
  "victory-core",
  "victory-pe",
  "windows-sys",
+]
+
+[[package]]
+name = "victory-mcp"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "tracing",
+ "tracing-subscriber",
+ "windows-sys",
+ "zlib-rs",
 ]
 
 [[package]]

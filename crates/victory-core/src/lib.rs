@@ -4,11 +4,14 @@
 //! * [`policy`]: the runtime half of rule #1, refusing to write
 //!   game-derived data into the source tree.
 //! * [`logging`]: one tracing setup for all binaries.
+//! * [`tunables`]: the registry of the `VICTORY_*` switches, readable and
+//!   changeable at run time (debug server, live settings file).
 
 pub mod config;
 pub mod logging;
 pub mod policy;
 pub mod story_clock;
+pub mod tunables;
 
 pub use config::Config;
 pub use policy::{PolicyError, ensure_outside_repo};
