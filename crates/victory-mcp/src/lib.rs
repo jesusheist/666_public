@@ -19,6 +19,7 @@ mod http;
 mod json;
 mod layer;
 pub mod memscan;
+mod threadcpu;
 mod protocol;
 pub mod remote_pad;
 mod ring;

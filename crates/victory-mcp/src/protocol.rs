@@ -3,7 +3,7 @@
 
 use crate::badpix::{CaptureMode, DEFAULT_MAX_DRAWS, DumpSpec, MAX_DRAWS_LIMIT, ScanParams};
 use crate::json::{self, Json};
-use crate::{KINDS, Shared, memscan, remote_pad};
+use crate::{KINDS, Shared, memscan, remote_pad, threadcpu};
 
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
 
@@ -606,6 +606,21 @@ pub fn tools() -> Json {
             ]),
         ),
         tool(
+            "thread_cpu",
+            "CPU use per thread pool",
+            "Samples every thread of the process over a window (kernel plus user time, from the thread times) and reports the total busy cores, then per pool (the thread name without its trailing number: victory-dstorage-3 is pool victory-dstorage; threads without a name are grouped as `unnamed <module>` by where they start): thread count, busy cores and the busiest thread's percent of one core, and the 15 busiest single threads (tid, name, percent of one core, Windows priority). Read-only.",
+            schema(vec![(
+                "ms",
+                Json::obj([
+                    ("type", Json::str("integer")),
+                    ("minimum", Json::Int(50)),
+                    ("maximum", Json::Int(threadcpu::MAX_MS)),
+                    ("default", Json::Int(threadcpu::DEFAULT_MS)),
+                    ("description", Json::str("The sample window in milliseconds.")),
+                ]),
+            )]),
+        ),
+        tool(
             "code_read",
             "Read title code bytes",
             "Raw bytes of the title's image around an address: [address - before, address + after), clipped to the image, as hex. Refuses addresses outside the image. Read-only.",
@@ -787,6 +802,12 @@ fn code_read_tool(args: &Json) -> Result<Json, ToolError> {
     ]))
 }
 
+fn thread_cpu_tool(args: &Json) -> Result<Json, ToolError> {
+    let ms = int_arg(args, "ms", threadcpu::DEFAULT_MS, 50, threadcpu::MAX_MS)? as u64;
+    let (samples, window) = threadcpu::sample(ms).map_err(ToolError::Failed)?;
+    Ok(threadcpu::report_json(&threadcpu::group(&samples, window), window))
+}
+
 #[cfg(windows)]
 fn mem_watch_tool(args: &Json) -> Result<Json, ToolError> {
     use std::time::{Duration, Instant};
@@ -887,6 +908,7 @@ fn call(shared: &Shared, params: Option<&Json>) -> Result<Json, RpcError> {
         "mem_read" => mem_read_tool(args),
         "mem_watch_writes" => mem_watch_tool(args),
         "code_read" => code_read_tool(args),
+        "thread_cpu" => thread_cpu_tool(args),
         "mem_scan_reset" => {
             memscan::scanner().reset();
             Ok(Json::obj([("reset", Json::Bool(true))]))
@@ -1425,7 +1447,7 @@ mod tests {
         let names: Vec<_> = tools.iter().filter_map(|t| t.get("name").and_then(Json::as_str)).collect();
         assert_eq!(
             names,
-            ["get_stats", "get_recent_log", "get_pipeline_events", "shader_history", "get_device_lost_report", "screenshot", "get_memory", "get_dropped_draws", "get_settings", "set_setting", "list_tunables", "get_tunable", "set_tunable", "reset_tunable", "cheat", "press", "stick", "release_all", "input_script", "find_bad_pixels", "frame_commands", "trace_pixel", "dump_target", "renderdoc_capture", "mem_regions", "mem_scan_start", "mem_scan_filter", "mem_scan_list", "mem_read", "mem_scan_reset", "mem_watch_writes", "code_read"]
+            ["get_stats", "get_recent_log", "get_pipeline_events", "shader_history", "get_device_lost_report", "screenshot", "get_memory", "get_dropped_draws", "get_settings", "set_setting", "list_tunables", "get_tunable", "set_tunable", "reset_tunable", "cheat", "press", "stick", "release_all", "input_script", "find_bad_pixels", "frame_commands", "trace_pixel", "dump_target", "renderdoc_capture", "mem_regions", "mem_scan_start", "mem_scan_filter", "mem_scan_list", "mem_read", "mem_scan_reset", "mem_watch_writes", "thread_cpu", "code_read"]
         );
         for t in tools {
             let schema = t.get("inputSchema").unwrap();
