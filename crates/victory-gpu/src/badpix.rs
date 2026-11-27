@@ -41,7 +41,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use victory_mcp::badpix::{Counts, DrawScan, ScanParams, ScanReport, TargetScan};
+use victory_mcp::badpix::{CaptureMode, Counts, DrawScan, DumpImage, ScanParams, ScanReport, TargetScan};
 use victory_mcp::{ScanEdge, ScanRequest};
 use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
@@ -461,6 +461,15 @@ pub(crate) struct Source {
     pub(crate) subresource: u32,
 }
 
+/// Bytes between two texel slots of the trace readback (the placement
+/// alignment of a copy into a buffer).
+const TEXEL_SLOT: u64 = 512;
+/// Texel slots a trace capture has: two for each target of each command.
+const TEXEL_SLOTS: u32 = 32_768;
+/// Largest target `dump_target` saves, in bytes read back.
+const MAX_DUMP_BYTES: u64 = 512 << 20;
+
+#[derive(Default)]
 struct TargetRec {
     role: String,
     resource: u64,
@@ -471,10 +480,16 @@ struct TargetRec {
     pre: Option<u32>,
     post: Option<u32>,
     skipped: Option<String>,
+    /// `trace_pixel`: the texel read and its slots in the trace readback.
+    texel: Option<(u32, u32)>,
+    texel_pre: Option<u32>,
+    texel_post: Option<u32>,
 }
 
 struct EntryRec {
     index: u32,
+    counts: [u32; 4],
+    list: u64,
     kind: &'static str,
     pipeline: String,
     shaders: Vec<(String, String)>,
@@ -486,9 +501,34 @@ struct Scratch {
     size: u64,
 }
 
+/// The target `dump_target` saved: its readback and what it holds.
+struct DumpState {
+    readback: ID3D12Resource,
+    bytes: u64,
+    after_command: u32,
+    kind: String,
+    shaders: Vec<(String, String)>,
+    role: String,
+    resource: u64,
+    format: u32,
+    subresource: u32,
+    footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+}
+
 struct Capture {
     request: Mutex<Option<ScanRequest>>,
     params: ScanParams,
+    mode: CaptureMode,
+    /// `trace_pixel`: the texels read, one slot of [`TEXEL_SLOT`] bytes each.
+    texels: Option<ID3D12Resource>,
+    texel_next: AtomicU32,
+    /// Commands seen, listed or not (their index).
+    cmd_next: AtomicU32,
+    /// `dump_target`: commands that ran the shader asked for so far, and
+    /// whether the dump has been taken.
+    shader_hits: AtomicU32,
+    dumped: AtomicBool,
+    dump: Mutex<Option<DumpState>>,
     scanner: Arc<Scanner>,
     device: ID3D12Device,
     results: ID3D12Resource,
@@ -543,7 +583,13 @@ pub(crate) fn recording() -> bool {
 
 /// Whether the capture asked for the texture UAVs too.
 pub(crate) fn wants_uav() -> bool {
-    locked(&CURRENT).as_ref().is_some_and(|c| c.params.include_uav)
+    locked(&CURRENT).as_ref().is_some_and(|c| c.params.include_uav || c.mode != CaptureMode::BadPixels)
+}
+
+/// Whether commands that write no target are numbered too (every mode but
+/// the bad-pixel scan).
+pub(crate) fn wants_every_command() -> bool {
+    locked(&CURRENT).as_ref().is_some_and(|c| c.mode != CaptureMode::BadPixels)
 }
 
 impl Capture {
@@ -589,12 +635,29 @@ struct Planned {
     at: usize,
 }
 
+/// A texel read before a command, to be read again after it.
+struct TexelPlan {
+    resource: usize,
+    subresource: u32,
+    xy: (u32, u32),
+    post: u32,
+}
+
+/// A target to save after the command.
+struct DumpPlan {
+    resource: usize,
+    subresource: u32,
+    at: usize,
+}
+
 /// A command being scanned: the pre-scans are recorded, the post-scans wait
 /// for [`end`].
 pub(crate) struct Ticket {
     capture: Arc<Capture>,
     entry: usize,
     planned: Vec<Planned>,
+    texels: Vec<TexelPlan>,
+    dump: Option<DumpPlan>,
 }
 
 fn scanner(device: &ID3D12Device) -> Result<Arc<Scanner>, String> {
@@ -627,9 +690,28 @@ pub(crate) fn present(
             match made {
                 Ok((scanner, results)) => {
                     let params = request.params.clone();
+                    let mode = params.mode;
+                    let texels = if mode == CaptureMode::Trace {
+                        match buffer(device, D3D12_HEAP_TYPE_READBACK, u64::from(TEXEL_SLOTS) * TEXEL_SLOT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST) {
+                            Ok(b) => Some(b),
+                            Err(why) => {
+                                request.fail(why);
+                                return None;
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     *locked(&CURRENT) = Some(Arc::new(Capture {
                         request: Mutex::new(Some(request)),
                         params,
+                        mode,
+                        texels,
+                        texel_next: AtomicU32::new(0),
+                        cmd_next: AtomicU32::new(0),
+                        shader_hits: AtomicU32::new(0),
+                        dumped: AtomicBool::new(false),
+                        dump: Mutex::new(None),
                         scanner,
                         device: device.clone(),
                         results,
@@ -668,6 +750,12 @@ pub(crate) fn present(
             ENDING.store(false, Ordering::Release);
             LISTED.store(false, Ordering::Release);
             capture.unsent.store(capture.unsubmitted(), Ordering::Relaxed);
+            if capture.mode != CaptureMode::BadPixels {
+                // Nothing to copy: the texels and the dump are read where they were written.
+                let used = u64::from(capture.texel_next.load(Ordering::Relaxed).min(TEXEL_SLOTS)) * TEXEL_SLOT;
+                let readback = capture.texels.clone();
+                return Some(Pending { capture, readback, bytes: used });
+            }
             let bytes = u64::from(HEADER_DWORDS + capture.next_slot.load(Ordering::Relaxed).min(SLOTS) * SLOT_DWORDS) * 4;
             let readback = buffer(device, D3D12_HEAP_TYPE_READBACK, bytes, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
             let readback = match readback {
@@ -694,7 +782,7 @@ pub(crate) fn present(
                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                 )]);
             }
-            Some(Pending { capture, readback, bytes })
+            Some(Pending { capture, readback: Some(readback), bytes })
         }
     }
 }
@@ -755,8 +843,24 @@ fn submitted_listed(list: &HostList) {
 /// A capture whose results are being copied by the present's list.
 pub(crate) struct Pending {
     capture: Arc<Capture>,
-    readback: ID3D12Resource,
+    /// The results copy (bad pixels) or the texels read (trace); the
+    /// other modes have none.
+    readback: Option<ID3D12Resource>,
     bytes: u64,
+}
+
+/// The bytes of a readback buffer after the GPU has written it.
+fn map_bytes(buffer: &ID3D12Resource, bytes: u64) -> Result<Vec<u8>, String> {
+    let mut data = std::ptr::null_mut();
+    // SAFETY: the copies have finished; the mapping spans the buffer, which is at least `bytes` long.
+    unsafe {
+        if buffer.Map(0, None, Some(&mut data)).is_err() || data.is_null() {
+            return Err("a readback buffer could not be mapped".to_owned());
+        }
+        let out = std::slice::from_raw_parts(data.cast::<u8>(), bytes as usize).to_vec();
+        buffer.Unmap(0, None);
+        Ok(out)
+    }
 }
 
 impl Pending {
@@ -764,23 +868,50 @@ impl Pending {
     /// the results and answers the request.
     pub(crate) fn deliver(self, frame: u64) {
         let Some(request) = locked(&self.capture.request).take() else { return };
-        let mut data = std::ptr::null_mut();
-        // SAFETY: the copy has finished; the mapping spans the buffer.
-        let bytes = unsafe {
-            if self.readback.Map(0, None, Some(&mut data)).is_err() || data.is_null() {
-                request.fail("the results buffer could not be mapped");
-                return;
-            }
-            let bytes = std::slice::from_raw_parts(data.cast::<u8>(), self.bytes as usize).to_vec();
-            self.readback.Unmap(0, None);
-            bytes
+        let bytes = match &self.readback {
+            Some(readback) if self.bytes > 0 => match map_bytes(readback, self.bytes) {
+                Ok(b) => b,
+                Err(why) => {
+                    request.fail(why);
+                    return;
+                }
+            },
+            _ => Vec::new(),
         };
-        request.deliver(report(&self.capture, &bytes, frame));
+        let mut report = report(&self.capture, &bytes, frame);
+        if let Some(d) = locked(&self.capture.dump).take() {
+            match map_bytes(&d.readback, d.bytes) {
+                Ok(data) => {
+                    let f = d.footprint.Footprint;
+                    report.dump = Some(DumpImage {
+                        after_command: d.after_command,
+                        kind: d.kind,
+                        shaders: d.shaders,
+                        role: d.role,
+                        resource: d.resource,
+                        format: d.format,
+                        subresource: d.subresource,
+                        width: f.Width,
+                        height: f.Height,
+                        pitch: f.RowPitch,
+                        data,
+                    });
+                }
+                Err(why) => report.notes.push(why),
+            }
+        }
+        request.deliver(report);
     }
 }
 
 fn report(capture: &Capture, bytes: &[u8], frame: u64) -> ScanReport {
     let counts = |slot: Option<u32>| slot.and_then(|s| slot_words(bytes, s)).map(|w| parse_slot(&w));
+    let texel = |slot: Option<u32>| -> Option<[u8; 16]> {
+        let at = slot? as usize * TEXEL_SLOT as usize;
+        let mut out = [0u8; 16];
+        out.copy_from_slice(bytes.get(at..at + 16)?);
+        Some(out)
+    };
     let entries = locked(&capture.entries);
     let draws = entries
         .iter()
@@ -789,6 +920,8 @@ fn report(capture: &Capture, bytes: &[u8], frame: u64) -> ScanReport {
             kind: e.kind.to_owned(),
             pipeline: e.pipeline.clone(),
             shaders: e.shaders.clone(),
+            counts: e.counts,
+            list: e.list,
             targets: e
                 .targets
                 .iter()
@@ -801,6 +934,9 @@ fn report(capture: &Capture, bytes: &[u8], frame: u64) -> ScanReport {
                     subresource: t.subresource,
                     pre: counts(t.pre),
                     post: counts(t.post),
+                    texel: t.texel,
+                    texel_pre: texel(t.texel_pre),
+                    texel_post: texel(t.texel_post),
                     skipped: t.skipped.clone(),
                 })
                 .collect(),
@@ -820,8 +956,15 @@ fn report(capture: &Capture, bytes: &[u8], frame: u64) -> ScanReport {
             "{unsent} command lists with scans were never given to the card (the title reset or dropped them); their scans did not run"
         ));
     }
-    if !capture.params.include_uav {
+    if capture.mode == CaptureMode::BadPixels && !capture.params.include_uav {
         notes.push("texture UAVs were not scanned (include_uav is false)".to_owned());
+    }
+    if capture.mode != CaptureMode::BadPixels {
+        notes.push(
+            "commands are numbered in the order they were recorded (the list's address is given: lists can run in another order \
+             on the card); ExecuteIndirect commands and commands the host dropped before recording are not numbered"
+                .to_owned(),
+        );
     }
     notes.push(
         "UAV textures are found through descriptor tables of the compute or graphics roots; views reached by a computed \
@@ -829,12 +972,14 @@ fn report(capture: &Capture, bytes: &[u8], frame: u64) -> ScanReport {
             .to_owned(),
     );
     ScanReport {
+        dump: None,
+        commands_seen: capture.cmd_next.load(Ordering::Relaxed),
         frame,
         back_buffer: capture.back,
         params: capture.params.clone(),
         draws,
-        slots_used: capture.next_slot.load(Ordering::Relaxed).min(SLOTS),
-        slots_total: SLOTS,
+        slots_used: capture.next_slot.load(Ordering::Relaxed).min(SLOTS).max(capture.texel_next.load(Ordering::Relaxed).min(TEXEL_SLOTS)),
+        slots_total: if capture.mode == CaptureMode::Trace { TEXEL_SLOTS } else { SLOTS },
         over_cap: capture.over_cap.load(Ordering::Relaxed),
         over_slots: capture.over_slots.load(Ordering::Relaxed),
         notes,
@@ -845,8 +990,11 @@ fn report(capture: &Capture, bytes: &[u8], frame: u64) -> ScanReport {
 /// float target, over the cap, or no slots left).
 #[cold]
 #[inline(never)]
-pub(crate) fn begin(list: &HostList, kind: &'static str, pipeline: Option<&HostPipeline>, sources: &[Source]) -> Option<Ticket> {
+pub(crate) fn begin(list: &HostList, kind: &'static str, pipeline: Option<&HostPipeline>, sources: &[Source], counts: [u32; 4]) -> Option<Ticket> {
     let capture = locked(&CURRENT).clone()?;
+    if capture.mode != CaptureMode::BadPixels {
+        return begin_mode(list, capture, kind, pipeline, sources, counts);
+    }
     let mut recs = Vec::new();
     let mut planned = Vec::new();
     for source in sources {
@@ -867,6 +1015,7 @@ pub(crate) fn begin(list: &HostList, kind: &'static str, pipeline: Option<&HostP
             pre: None,
             post: None,
             skipped: None,
+            ..Default::default()
         };
         let verdict = (|| {
             let kind = kind_for(own, view)?;
@@ -929,6 +1078,8 @@ pub(crate) fn begin(list: &HostList, kind: &'static str, pipeline: Option<&HostP
         let index = entries.len() as u32;
         entries.push(EntryRec {
             index,
+            counts,
+            list: list.list.as_raw() as u64,
             kind,
             pipeline: pipeline.map_or_else(String::new, |p| p.name.clone()),
             shaders: pipeline.map_or_else(Vec::new, |p| p.stages.iter().map(|s| (s.shader.stage.to_owned(), s.shader.hash.clone())).collect()),
@@ -936,7 +1087,7 @@ pub(crate) fn begin(list: &HostList, kind: &'static str, pipeline: Option<&HostP
         });
         entries.len() - 1
     };
-    let ticket = Ticket { capture, entry, planned };
+    let ticket = Ticket { capture, entry, planned, texels: Vec::new(), dump: None };
     for p in &ticket.planned {
         scan(list, &ticket.capture, p, p.pre);
     }
@@ -950,6 +1101,12 @@ pub(crate) fn end(list: &HostList, ticket: Ticket) {
     for p in &ticket.planned {
         scan(list, &ticket.capture, p, p.post);
     }
+    for t in &ticket.texels {
+        copy_texel(list, &ticket.capture, t.resource, t.subresource, t.xy, t.post);
+    }
+    if let Some(plan) = &ticket.dump {
+        dump_copy(list, &ticket, plan);
+    }
 }
 
 /// The command was dropped by the host: nothing was written after the
@@ -962,6 +1119,12 @@ pub(crate) fn dropped(ticket: Ticket) {
         let t = &mut entries[ticket.entry].targets[p.at];
         t.post = None;
         t.skipped = Some("the host dropped this command (nothing was drawn)".to_owned());
+    }
+    if ticket.planned.is_empty() {
+        for t in &mut entries[ticket.entry].targets {
+            t.texel_post = None;
+            t.skipped = Some("the host dropped this command (nothing was drawn)".to_owned());
+        }
     }
 }
 
@@ -986,6 +1149,314 @@ fn scan(list: &HostList, capture: &Capture, p: &Planned, slot: u32) {
     // The readback waits for this list to be submitted.
     locked(&capture.listed).insert(list.list.as_raw() as usize, false);
     LISTED.store(true, Ordering::Release);
+}
+
+/// The capture modes other than the bad-pixel scan: numbers the command, and
+/// for a trace reads the followed texel of every target before it (and
+/// after it, in [`end`]); for a dump plans the save of one target.
+#[cold]
+#[inline(never)]
+fn begin_mode(
+    list: &HostList,
+    capture: Arc<Capture>,
+    kind: &'static str,
+    pipeline: Option<&HostPipeline>,
+    sources: &[Source],
+    counts: [u32; 4],
+) -> Option<Ticket> {
+    let index = capture.cmd_next.fetch_add(1, Ordering::Relaxed);
+    let shaders: Vec<(String, String)> =
+        pipeline.map_or_else(Vec::new, |p| p.stages.iter().map(|s| (s.shader.stage.to_owned(), s.shader.hash.clone())).collect());
+    let has = |wanted: &str| {
+        let wanted = wanted.to_ascii_lowercase();
+        shaders.iter().any(|(_, h)| h.to_ascii_lowercase().contains(&wanted))
+    };
+    let mut dump_wanted = false;
+    if capture.mode == CaptureMode::Dump {
+        let Some(spec) = &capture.params.dump else { return None };
+        let here = match (&spec.after_command, &spec.after_shader) {
+            (Some(n), _) => *n == index,
+            (None, Some(hash)) => has(hash) && capture.shader_hits.fetch_add(1, Ordering::Relaxed) == spec.occurrence,
+            _ => false,
+        };
+        if !here || capture.dumped.swap(true, Ordering::Relaxed) {
+            return None;
+        }
+        dump_wanted = true;
+    } else {
+        let filter = &capture.params.shader_filter;
+        if !filter.is_empty() && !filter.iter().any(|f| has(f)) {
+            return None;
+        }
+        if capture.entries_made.fetch_add(1, Ordering::Relaxed) >= capture.params.max_draws {
+            capture.entries_made.fetch_sub(1, Ordering::Relaxed);
+            capture.over_cap.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+    }
+    let mut srcs: Vec<(String, usize, u32, u32)> = sources.iter().map(|s| (s.role.clone(), s.resource, s.view_format, s.subresource)).collect();
+    // A dump of a texture that is not one of the command's own targets.
+    if let Some(spec) = capture.params.dump.as_ref().filter(|_| dump_wanted)
+        && let Some(resource) = spec.resource
+        && !srcs.iter().any(|s| s.1 as u64 == resource && s.3 == spec.subresource)
+    {
+        srcs.push(("resource".to_owned(), resource as usize, 0, spec.subresource));
+    }
+    let mut recs = Vec::new();
+    let mut texels = Vec::new();
+    for (role, resource, view_format, subresource) in srcs {
+        let mut rec = TargetRec { role, resource: resource as u64, format: view_format, subresource, ..Default::default() };
+        let Some(host) = crate::resource::host_resource(resource as This) else {
+            rec.skipped = Some("the texture is gone".to_owned());
+            recs.push(rec);
+            continue;
+        };
+        // SAFETY: a live resource.
+        let desc = unsafe { host.GetDesc() };
+        let own = desc.Format.0 as u32;
+        if rec.format == 0 {
+            rec.format = own;
+        }
+        let verdict = (|| {
+            if desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+                return Err("not a 2D texture".to_owned());
+            }
+            if desc.SampleDesc.Count > 1 {
+                return Err("multisampled".to_owned());
+            }
+            let subs = u32::from(desc.MipLevels) * u32::from(desc.DepthOrArraySize);
+            if subresource >= subs {
+                return Err("subresource out of range".to_owned());
+            }
+            let mip = subresource % u32::from(desc.MipLevels.max(1));
+            let (w, h) = ((desc.Width >> mip).max(1) as u32, (desc.Height >> mip).max(1));
+            if w > MAX_SIDE || h > MAX_SIDE {
+                return Err(format!("{w}x{h} is bigger than {MAX_SIDE}"));
+            }
+            Ok((w, h))
+        })();
+        match verdict {
+            Ok((w, h)) => {
+                (rec.width, rec.height) = (w, h);
+                if capture.mode == CaptureMode::Trace {
+                    if let Some((px, py)) = capture.params.pixel {
+                        let xy = map_pixel((px, py), capture.back, (w, h));
+                        let first = capture.texel_next.fetch_add(2, Ordering::Relaxed);
+                        if first.saturating_add(2) > TEXEL_SLOTS {
+                            capture.texel_next.store(TEXEL_SLOTS, Ordering::Relaxed);
+                            capture.over_slots.fetch_add(1, Ordering::Relaxed);
+                            rec.skipped = Some("the texel slots of this capture are used up".to_owned());
+                        } else {
+                            rec.texel = Some(xy);
+                            rec.texel_pre = Some(first);
+                            rec.texel_post = Some(first + 1);
+                            texels.push(TexelPlan { resource, subresource, xy, post: first + 1 });
+                        }
+                    }
+                }
+            }
+            Err(why) => {
+                capture.skip(&why);
+                rec.skipped = Some(why);
+            }
+        }
+        recs.push(rec);
+    }
+    let dump = if dump_wanted {
+        let spec = capture.params.dump.clone().unwrap_or_default();
+        let at = recs.iter().position(|r| {
+            r.skipped.is_none()
+                && match (&spec.resource, &spec.role) {
+                    (Some(res), _) => r.resource == *res && r.subresource == spec.subresource,
+                    (None, Some(role)) => &r.role == role,
+                    (None, None) => true,
+                }
+        });
+        at.map(|at| DumpPlan { resource: recs[at].resource as usize, subresource: recs[at].subresource, at })
+    } else {
+        None
+    };
+    if dump_wanted && dump.is_none() {
+        capture.skip("dump_target: no target of that command matches (or it has none)");
+    }
+    let entry = {
+        let mut entries = locked(&capture.entries);
+        entries.push(EntryRec {
+            index,
+            counts,
+            list: list.list.as_raw() as u64,
+            kind,
+            pipeline: pipeline.map_or_else(String::new, |p| p.name.clone()),
+            shaders,
+            targets: recs,
+        });
+        entries.len() - 1
+    };
+    let ticket = Ticket { capture, entry, planned: Vec::new(), texels, dump };
+    // The texels before the command, in the order they were planned.
+    let firsts: Vec<(usize, u32, (u32, u32), u32)> = {
+        let entries = locked(&ticket.capture.entries);
+        entries[ticket.entry]
+            .targets
+            .iter()
+            .filter_map(|t| Some((t.resource as usize, t.subresource, t.texel?, t.texel_pre?)))
+            .collect()
+    };
+    for (resource, subresource, xy, slot) in firsts {
+        copy_texel(list, &ticket.capture, resource, subresource, xy, slot);
+    }
+    if ticket.texels.is_empty() && ticket.dump.is_none() {
+        // Nothing is recorded around the command: the capture only lists it.
+        return None;
+    }
+    Some(ticket)
+}
+
+/// The texel of a `target` sized target that the back buffer's pixel `px`
+/// falls on (proportional: a scene target at DLSS internal resolution is
+/// smaller than the back buffer).
+pub(crate) fn map_pixel(px: (u32, u32), back: (u32, u32), target: (u32, u32)) -> (u32, u32) {
+    let map = |p: u32, b: u32, t: u32| -> u32 {
+        if b == 0 {
+            return 0;
+        }
+        let at = (u64::from(p) * 2 + 1) * u64::from(t) / (u64::from(b) * 2);
+        at.min(u64::from(t.saturating_sub(1))) as u32
+    };
+    (map(px.0, back.0, target.0), map(px.1, back.1, target.1))
+}
+
+/// Records the copy of texel `xy` of `subresource` of `texture` (in the
+/// copy-source state) into slot `slot` of `readback` (a readback buffer).
+fn record_texel(
+    list: &ID3D12GraphicsCommandList,
+    device: &ID3D12Device,
+    texture: &ID3D12Resource,
+    desc: &D3D12_RESOURCE_DESC,
+    subresource: u32,
+    xy: (u32, u32),
+    readback: &ID3D12Resource,
+    slot: u32,
+) {
+    let (mut fp, _) = footprint(device, desc, subresource);
+    fp.Offset = u64::from(slot) * TEXEL_SLOT;
+    fp.Footprint.Width = 1;
+    fp.Footprint.Height = 1;
+    fp.Footprint.Depth = 1;
+    fp.Footprint.RowPitch = 256;
+    let bx = D3D12_BOX { left: xy.0, top: xy.1, front: 0, right: xy.0 + 1, bottom: xy.1 + 1, back: 1 };
+    // SAFETY: an open list; live resources that the caller keeps until the list has run.
+    unsafe {
+        let to = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: std::mem::transmute_copy(readback),
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp },
+        };
+        let from = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: std::mem::transmute_copy(texture),
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: subresource },
+        };
+        list.CopyTextureRegion(&to, 0, 0, 0, &from, Some(&raw const bx));
+    }
+}
+
+/// Records the copy of one texel of the subresource into slot `slot` of the
+/// trace readback (the texture goes to the copy-source state and back).
+fn copy_texel(list: &HostList, capture: &Capture, resource: usize, subresource: u32, xy: (u32, u32), slot: u32) {
+    let Some(readback) = capture.texels.as_ref() else { return };
+    let this = resource as This;
+    let Some(host) = crate::resource::host_resource(this) else { return };
+    // SAFETY: a live resource.
+    let desc = unsafe { host.GetDesc() };
+    let before = list.texture_state(this);
+    crate::list::ensure_state(list, this, COPY_SOURCE);
+    record_texel(&list.list, &capture.device, host, &desc, subresource, xy, readback, slot);
+    if let Some(state) = before {
+        crate::list::ensure_state(list, this, state);
+    }
+    list.keep(readback);
+    locked(&capture.listed).insert(list.list.as_raw() as usize, false);
+    LISTED.store(true, Ordering::Release);
+}
+
+/// Records the copy of the whole planned subresource into a readback
+/// buffer of its own, right after the command.
+fn dump_copy(list: &HostList, ticket: &Ticket, plan: &DumpPlan) {
+    let capture = &ticket.capture;
+    let this = plan.resource as This;
+    let Some(host) = crate::resource::host_resource(this) else { return };
+    // SAFETY: a live resource.
+    let desc = unsafe { host.GetDesc() };
+    let (fp, total) = footprint(&capture.device, &desc, plan.subresource);
+    if total > MAX_DUMP_BYTES {
+        capture.skip(&format!("dump_target: the target needs {total} bytes of readback (over the limit)"));
+        return;
+    }
+    let readback = match buffer(&capture.device, D3D12_HEAP_TYPE_READBACK, total.max(256), D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST) {
+        Ok(b) => b,
+        Err(why) => {
+            capture.skip(&why);
+            return;
+        }
+    };
+    let before = list.texture_state(this);
+    crate::list::ensure_state(list, this, COPY_SOURCE);
+    // SAFETY: an open list; live resources kept until the list has run.
+    unsafe {
+        let to = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: std::mem::transmute_copy(&readback),
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp },
+        };
+        let from = D3D12_TEXTURE_COPY_LOCATION {
+            pResource: std::mem::transmute_copy(host),
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: plan.subresource },
+        };
+        list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+    }
+    if let Some(state) = before {
+        crate::list::ensure_state(list, this, state);
+    }
+    list.keep(&readback);
+    locked(&capture.listed).insert(list.list.as_raw() as usize, false);
+    LISTED.store(true, Ordering::Release);
+    let entries = locked(&capture.entries);
+    let entry = &entries[ticket.entry];
+    let rec = &entry.targets[plan.at];
+    *locked(&capture.dump) = Some(DumpState {
+        readback,
+        bytes: total,
+        after_command: entry.index,
+        kind: entry.kind.to_owned(),
+        shaders: entry.shaders.clone(),
+        role: rec.role.clone(),
+        resource: rec.resource,
+        format: rec.format,
+        subresource: plan.subresource,
+        footprint: fp,
+    });
+}
+
+#[cfg(test)]
+mod mode_tests {
+    use super::map_pixel;
+
+    #[test]
+    fn a_back_buffer_pixel_lands_on_the_proportional_texel() {
+        // Same size: the same pixel.
+        assert_eq!(map_pixel((670, 620), (1920, 1080), (1920, 1080)), (670, 620));
+        // DLSS quality: 1280x720 for 1920x1080 (a 2/3 scale).
+        assert_eq!(map_pixel((670, 620), (1920, 1080), (1280, 720)), (447, 413));
+        // The last pixel stays inside, the first is the first.
+        assert_eq!(map_pixel((1919, 1079), (1920, 1080), (1280, 720)), (1279, 719));
+        assert_eq!(map_pixel((0, 0), (1920, 1080), (1280, 720)), (0, 0));
+        // A smaller target, a bigger one, one texel.
+        assert_eq!(map_pixel((960, 540), (1920, 1080), (1, 1)), (0, 0));
+        assert_eq!(map_pixel((1, 1), (2, 2), (4, 4)), (3, 3));
+        assert_eq!(map_pixel((5, 5), (0, 0), (4, 4)), (0, 0));
+    }
 }
 
 #[cfg(test)]
@@ -1256,6 +1727,41 @@ mod tests {
     }
 
     #[test]
+    fn one_texel_of_any_format_is_copied_into_its_slot() {
+        let Some(mut rig) = Rig::new() else {
+            eprintln!("no hardware adapter: the texel test is skipped");
+            return;
+        };
+        let readback = buffer(&rig.device, D3D12_HEAP_TYPE_READBACK, 4 * TEXEL_SLOT, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST).unwrap();
+        // 4x2 RGBA8: texel (3, 1) is the last one; 2x2 typeless RGBA16 and R11G11B10.
+        let rgba8: Vec<u8> = (0..32u8).collect();
+        let t8 = rig.texture(DXGI_FORMAT_R8G8B8A8_UNORM, (4, 2), 16, &rgba8);
+        let t16 = rig.texture(DXGI_FORMAT_R16G16B16A16_TYPELESS, (2, 2), 16, &(100..132u8).collect::<Vec<_>>());
+        let packed: Vec<u8> = [0x11111111u32, 0x22222222, 0x33333333, 0x44444444].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let t11 = rig.texture(DXGI_FORMAT_R11G11B10_FLOAT, (2, 2), 8, &packed);
+        let device = rig.device.clone();
+        rig.run(|list| {
+            for (slot, texture, xy) in [(0u32, &t8, (3u32, 1u32)), (1, &t16, (1, 0)), (3, &t11, (0, 1))] {
+                // SAFETY: a live texture.
+                let desc = unsafe { texture.GetDesc() };
+                record_texel(list, &device, texture, &desc, 0, xy, &readback, slot);
+            }
+        });
+        let mut data = std::ptr::null_mut();
+        // SAFETY: the copies have finished; the mapping spans the buffer.
+        let bytes = unsafe {
+            readback.Map(0, None, Some(&mut data)).unwrap();
+            let b = std::slice::from_raw_parts(data.cast::<u8>(), 4 * TEXEL_SLOT as usize).to_vec();
+            readback.Unmap(0, None);
+            b
+        };
+        let at = |slot: usize| &bytes[slot * TEXEL_SLOT as usize..];
+        assert_eq!(&at(0)[..4], &[28, 29, 30, 31]);
+        assert_eq!(&at(1)[..8], &[108, 109, 110, 111, 112, 113, 114, 115]);
+        assert_eq!(&at(3)[..4], &0x33333333u32.to_le_bytes());
+    }
+
+    #[test]
     fn formats_with_no_nan_are_refused_and_typeless_textures_follow_their_view() {
         assert_eq!(kind_for(10, 10), Ok(5));
         assert_eq!(kind_for(9, 10), Ok(5));
@@ -1298,6 +1804,13 @@ mod tests {
         let capture = Arc::new(Capture {
             request: Mutex::new(None),
             params: ScanParams::default(),
+            mode: CaptureMode::BadPixels,
+            texels: None,
+            texel_next: AtomicU32::new(0),
+            cmd_next: AtomicU32::new(0),
+            shader_hits: AtomicU32::new(0),
+            dumped: AtomicBool::new(false),
+            dump: Mutex::new(None),
             scanner,
             device: rig.device.clone(),
             results: results_buffer(&rig.device).unwrap(),

@@ -3718,7 +3718,7 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
-        let scanned = self.scan_begin(list, "dispatch", true);
+        let scanned = self.scan_begin(list, "dispatch", true, [x, y, z, 0]);
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
@@ -4281,7 +4281,7 @@ impl State {
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
-        let scanned = self.scan_begin(list, "mesh", false);
+        let scanned = self.scan_begin(list, "mesh", false, [x, 0, 0, 0]);
         let ran = mesh_test() != 1
             && mesh_kept(self.pipeline)
             && self.prepare_for(list, false, true)
@@ -4773,7 +4773,7 @@ impl State {
         if crate::streamline::hudless_wanted() {
             self.before_shown_target(list, vertices == 3 && instances == 1);
         }
-        let scanned = self.scan_begin(list, "draw", false);
+        let scanned = self.scan_begin(list, "draw", false, [vertices, instances, first, first_instance]);
         let ready = self.prepare(list, false);
         // A pipeline with the rectangle geometry stage draws the title's
         // vertices as they are; any other gets its rectangles expanded.
@@ -4981,7 +4981,7 @@ impl State {
         if lost {
             once!("indexed rectangles not drawn");
         }
-        let scanned = self.scan_begin(list, "indexed", false);
+        let scanned = self.scan_begin(list, "indexed", false, [indices, instances, first, base as u32]);
         let ran = !lost && self.prepare(list, true);
         if ran {
             #[cfg(feature = "diagnostics")]
@@ -5010,22 +5010,23 @@ impl State {
     /// Called before the command's own state is set on the list: the scans
     /// bind a compute pipeline and root signature of their own.
     #[inline]
-    fn scan_begin(&mut self, list: &HostList, kind: &'static str, compute: bool) -> Option<crate::badpix::Ticket> {
+    fn scan_begin(&mut self, list: &HostList, kind: &'static str, compute: bool, counts: [u32; 4]) -> Option<crate::badpix::Ticket> {
         if !crate::badpix::recording() {
             return None;
         }
-        self.scan_begin_recording(list, kind, compute)
+        self.scan_begin_recording(list, kind, compute, counts)
     }
 
     #[cold]
     #[inline(never)]
-    fn scan_begin_recording(&mut self, list: &HostList, kind: &'static str, compute: bool) -> Option<crate::badpix::Ticket> {
+    fn scan_begin_recording(&mut self, list: &HostList, kind: &'static str, compute: bool, counts: [u32; 4]) -> Option<crate::badpix::Ticket> {
         let sources = self.scan_sources(compute, crate::badpix::wants_uav());
-        if sources.is_empty() {
+        // The command lists, trace and dump captures number every command, with targets or not.
+        if sources.is_empty() && !crate::badpix::wants_every_command() {
             return None;
         }
         let pipeline = crate::pipeline::host_pipeline(self.pipeline as This);
-        let ticket = crate::badpix::begin(list, kind, pipeline, &sources);
+        let ticket = crate::badpix::begin(list, kind, pipeline, &sources, counts);
         if ticket.is_some() {
             // The scans set a pipeline and root signature of their own.
             self.host_pipeline = 0;

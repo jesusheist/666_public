@@ -15,9 +15,44 @@ use std::path::{Path, PathBuf};
 pub const MAX_DRAWS_LIMIT: u32 = 100_000;
 pub const DEFAULT_MAX_DRAWS: u32 = 20_000;
 
+/// What a one-frame capture is for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CaptureMode {
+    /// `find_bad_pixels`: scan float targets for NaN and Inf.
+    #[default]
+    BadPixels,
+    /// `frame_commands`: list every draw and dispatch, scan nothing.
+    Commands,
+    /// `trace_pixel`: read one texel of every target around every command.
+    Trace,
+    /// `dump_target`: save one target after one command.
+    Dump,
+}
+
+/// Which target to save after which command (`dump_target`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DumpSpec {
+    /// The command's index in the capture.
+    pub after_command: Option<u32>,
+    /// Or: the command whose pipeline has this shader hash (`occurrence`
+    /// counts the matches from 0).
+    pub after_shader: Option<String>,
+    pub occurrence: u32,
+    /// The title resource to save (default: the command's first target).
+    pub resource: Option<u64>,
+    /// Or the role of one of the command's targets (`rt0`, `uav ...`).
+    pub role: Option<String>,
+    pub subresource: u32,
+}
+
 /// What the caller asked for.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScanParams {
+    pub mode: CaptureMode,
+    /// `frame_commands`, `trace_pixel`: keep only commands whose shaders
+    /// have a hash containing one of these.
+    pub shader_filter: Vec<String>,
+    pub dump: Option<DumpSpec>,
     /// Draws and dispatches scanned at most (the rest are counted).
     pub max_draws: u32,
     /// A screen pixel whose value is followed through the frame, on the
@@ -29,7 +64,14 @@ pub struct ScanParams {
 
 impl Default for ScanParams {
     fn default() -> Self {
-        ScanParams { max_draws: DEFAULT_MAX_DRAWS, pixel: None, include_uav: false }
+        ScanParams {
+            mode: CaptureMode::BadPixels,
+            shader_filter: Vec::new(),
+            dump: None,
+            max_draws: DEFAULT_MAX_DRAWS,
+            pixel: None,
+            include_uav: false,
+        }
     }
 }
 
@@ -79,6 +121,11 @@ pub struct TargetScan {
     pub subresource: u32,
     pub pre: Option<Counts>,
     pub post: Option<Counts>,
+    /// `trace_pixel`: the texel read (in this target's own size) and its
+    /// bytes (as many as the format's texel has) before and after the command.
+    pub texel: Option<(u32, u32)>,
+    pub texel_pre: Option<[u8; 16]>,
+    pub texel_post: Option<[u8; 16]>,
     /// Why it was not scanned (a format with no NaN, multisampled, too large).
     pub skipped: Option<String>,
 }
@@ -124,6 +171,12 @@ pub struct DrawScan {
     /// (stage, hash) as the log prints them (`hash=...`).
     pub shaders: Vec<(String, String)>,
     pub targets: Vec<TargetScan>,
+    /// Dispatch: groups x, y, z. Draw: vertices, instances, first vertex,
+    /// first instance. Indexed: indices, instances, first index, base vertex
+    /// (as bits). Mesh: groups.
+    pub counts: [u32; 4],
+    /// The host command list it was recorded on (its address).
+    pub list: u64,
 }
 
 impl DrawScan {
@@ -143,9 +196,30 @@ impl DrawScan {
     }
 }
 
+/// One target as it was after a command (`dump_target`), as read back.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DumpImage {
+    pub after_command: u32,
+    pub kind: String,
+    pub shaders: Vec<(String, String)>,
+    pub role: String,
+    pub resource: u64,
+    pub format: u32,
+    pub subresource: u32,
+    pub width: u32,
+    pub height: u32,
+    /// Bytes from one row to the next in `data`.
+    pub pitch: u32,
+    pub data: Vec<u8>,
+}
+
 /// What the capture of one frame found.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ScanReport {
+    /// `dump_target`: the saved target, if the command was reached.
+    pub dump: Option<DumpImage>,
+    /// Commands the capture saw, listed or not (the next index).
+    pub commands_seen: u32,
     pub frame: u64,
     pub back_buffer: (u32, u32),
     pub params: ScanParams,
@@ -499,6 +573,7 @@ mod tests {
             pre: Some(pre),
             post: Some(post),
             skipped: None,
+            ..Default::default()
         }
     }
 
@@ -509,6 +584,7 @@ mod tests {
             pipeline: pipeline.into(),
             shaders: vec![("vertex".into(), format!("v{index}")), ("pixel".into(), format!("p{index}"))],
             targets,
+            ..Default::default()
         }
     }
 

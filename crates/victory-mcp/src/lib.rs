@@ -13,6 +13,7 @@
 //! ([`take_shot_request`]), reads the frame back and hands it over a channel.
 
 pub mod badpix;
+mod framecap;
 mod history;
 mod http;
 mod json;
@@ -37,7 +38,7 @@ pub use layer::LogLayer;
 pub use memscan::{MemHooks, MemRegion, set_mem_hooks};
 pub use protocol::{PROTOCOL_VERSION, handle_body, Outcome};
 pub use server::{ServerHandle, start};
-pub use badpix::{ScanParams, ScanReport};
+pub use badpix::{CaptureMode, ScanParams, ScanReport};
 pub use history::TranslationSource;
 pub use shot::RawFrame;
 
@@ -445,6 +446,15 @@ impl Shared {
     /// report (`timeout`: for the two presents and the frame's own time),
     /// then writes it as JSON. Returns the summary and the file.
     pub fn find_bad_pixels(&self, params: ScanParams, timeout: Duration) -> Result<(ScanReport, PathBuf, String), String> {
+        let report = self.capture_frame(params, timeout)?;
+        let path = badpix::save(&report, &self.config.shots_dir)?;
+        let text = badpix::summary(&report);
+        Ok((report, path, text))
+    }
+
+    /// Arms a capture of the frame after the next present (what the mode
+    /// in `params` records) and waits for its report.
+    pub fn capture_frame(&self, params: ScanParams, timeout: Duration) -> Result<ScanReport, String> {
         let _one = self
             .scan_gate
             .try_lock()
@@ -467,9 +477,12 @@ impl Shared {
             }
             Err(RecvTimeoutError::Disconnected) => return Err("the request was dropped".into()),
         };
-        let path = badpix::save(&report, &self.config.shots_dir)?;
-        let text = badpix::summary(&report);
-        Ok((report, path, text))
+        Ok(report)
+    }
+
+    /// The folder the shots and reports go to.
+    pub fn shots_dir(&self) -> &std::path::Path {
+        &self.config.shots_dir
     }
 }
 

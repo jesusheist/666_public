@@ -1,7 +1,7 @@
 //! MCP over JSON-RPC 2.0: `initialize`, `ping`, `tools/list`, `tools/call`,
 //! and the notifications a client sends.
 
-use crate::badpix::{DEFAULT_MAX_DRAWS, MAX_DRAWS_LIMIT, ScanParams};
+use crate::badpix::{CaptureMode, DEFAULT_MAX_DRAWS, DumpSpec, MAX_DRAWS_LIMIT, ScanParams};
 use crate::json::{self, Json};
 use crate::{KINDS, Shared, memscan, remote_pad};
 
@@ -409,6 +409,72 @@ pub fn tools() -> Json {
             ]),
         ),
         tool(
+            "frame_commands",
+            "List every draw and dispatch of one frame",
+            "Captures one frame (the one after the next present) and lists every draw and dispatch in recording order: index, kind, \
+             pipeline name, the shader hash of each stage, dispatch groups or vertex, index and instance counts, and every render \
+             target and texture UAV it writes (resource, format, size). With shader_hashes only the commands that run one of them \
+             are listed (indices stay those of the whole frame) and shader_hits says per hash whether it ran in this frame and at \
+             which indices. ExecuteIndirect commands are not captured. The frame runs slowly while captured. Writes the full list as \
+             JSON under the shots folder (framecommands-<time>-f<frame>.json) and returns the summary and the path. Waits up to 120 s.",
+            schema(vec![
+                (
+                    "shader_hashes",
+                    Json::obj([
+                        ("type", Json::str("array")),
+                        ("items", Json::obj([("type", Json::str("string"))])),
+                        ("description", Json::str("Only commands with a shader whose hash contains one of these texts (case-insensitive).")),
+                    ]),
+                ),
+                ("max_draws", max_draws_schema("List at most this many commands; the rest are counted.")),
+            ]),
+        ),
+        tool(
+            "trace_pixel",
+            "Follow one screen pixel through the frame",
+            "Captures one frame and follows one screen pixel (back buffer coordinates) through EVERY render target and texture UAV \
+             any draw or dispatch writes, whatever its size or format: the pixel is mapped proportionally to each target (so the \
+             scene targets at DLSS internal resolution are traced). The texel is read right before and right after each command, \
+             decoded (RGBA8, BGRA8, sRGB, R10G10B10A2, R11G11B10F, RGBA16F, R16F, R32F, R32 uint and more) and every command that \
+             changed it is reported with its before and after values, shader hashes and target. The summary ranks the commands \
+             that made the texel darker (largest drop of luma first; sRGB formats are compared as stored). Commands are in \
+             recording order. The frame runs slowly while captured. Writes the full trace as JSON (pixeltrace-<time>-f<frame>.json) \
+             and returns the summary and the path. Waits up to 120 s.",
+            schema(vec![
+                ("pixel", pixel_schema("The screen pixel to follow, in back buffer coordinates.")),
+                (
+                    "shader_hashes",
+                    Json::obj([
+                        ("type", Json::str("array")),
+                        ("items", Json::obj([("type", Json::str("string"))])),
+                        ("description", Json::str("Only trace commands with a shader whose hash contains one of these texts.")),
+                    ]),
+                ),
+                ("max_draws", max_draws_schema("Trace at most this many commands; the rest are counted.")),
+            ]),
+        ),
+        tool(
+            "dump_target",
+            "Save a render target after a command as a PNG",
+            "Captures one frame and saves one texture right after one command as a PNG under the shots folder (target-<time>-f<frame>-cmd<N>.png). \
+             Name the command with after_command (the index frame_commands or trace_pixel gave; frames can differ by a few commands, \
+             so the answer names the command's shaders to check) or with after_shader (a shader hash; occurrence counts its commands \
+             from 0). The texture is the command's first target, or the one named by role (rt0, ...) or resource (an address from \
+             frame_commands; any texture then, in subresource). Float formats are tone-mapped (exposure, then x / (1 + x), then \
+             sRGB), normalized ones shown as stored, integers scaled to their largest value. channel picks rgb, r, g, b or a. The \
+             frame runs slowly while captured. Waits up to 120 s.",
+            schema(vec![
+                ("after_command", Json::obj([("type", Json::str("integer")), ("minimum", Json::Int(0)), ("description", Json::str("The command's index in the capture."))])),
+                ("after_shader", Json::obj([("type", Json::str("string")), ("description", Json::str("The first command (or the occurrence-th) running a shader with this hash."))])),
+                ("occurrence", Json::obj([("type", Json::str("integer")), ("minimum", Json::Int(0)), ("default", Json::Int(0))])),
+                ("role", Json::obj([("type", Json::str("string")), ("description", Json::str("Which target of the command: rt0, rt1, ... or the uav role frame_commands printed."))])),
+                ("resource", Json::obj([("type", Json::str("string")), ("description", Json::str("A texture's address (0x...), as frame_commands prints it."))])),
+                ("subresource", Json::obj([("type", Json::str("integer")), ("minimum", Json::Int(0)), ("default", Json::Int(0))])),
+                ("channel", Json::obj([("type", Json::str("string")), ("enum", Json::Arr(["rgb", "r", "g", "b", "a"].iter().map(|c| Json::str(*c)).collect())), ("default", Json::str("rgb"))])),
+                ("exposure", Json::obj([("type", Json::str("number")), ("minimum", Json::Int(0)), ("default", Json::Int(1)), ("description", Json::str("Multiplier for float formats before tone mapping."))])),
+            ]),
+        ),
+        tool(
             "mem_regions",
             "Title memory ranges",
             "The title's committed, readable and writable memory ranges (what a memory scan covers): base, end, size, protection and kind \
@@ -798,6 +864,9 @@ fn call(shared: &Shared, params: Option<&Json>) -> Result<Json, RpcError> {
         "reset_tunable" => tunables_tool(|h| (h.reset)(required_name(args)?).map_err(ToolError::Failed)),
         "cheat" => cheat_tool(args),
         "find_bad_pixels" => find_bad_pixels(shared, args),
+        "frame_commands" => frame_commands(shared, args),
+        "trace_pixel" => trace_pixel(shared, args),
+        "dump_target" => dump_target(shared, args),
         "mem_regions" => mem_regions_tool(args),
         "mem_scan_start" => mem_scan_start(args),
         "mem_scan_filter" => mem_scan_filter(args),
@@ -1125,6 +1194,105 @@ fn scan_params(args: &Json) -> Result<ScanParams, ToolError> {
     Ok(params)
 }
 
+fn max_draws_schema(what: &str) -> Json {
+    Json::obj([
+        ("type", Json::str("integer")),
+        ("minimum", Json::Int(1)),
+        ("maximum", Json::Int(i64::from(MAX_DRAWS_LIMIT))),
+        ("default", Json::Int(i64::from(DEFAULT_MAX_DRAWS))),
+        ("description", Json::str(what)),
+    ])
+}
+
+fn pixel_schema(what: &str) -> Json {
+    Json::obj([
+        ("type", Json::str("object")),
+        (
+            "properties",
+            Json::obj([
+                ("x", Json::obj([("type", Json::str("integer")), ("minimum", Json::Int(0)), ("maximum", Json::Int(i64::from(MAX_PIXEL)))])),
+                ("y", Json::obj([("type", Json::str("integer")), ("minimum", Json::Int(0)), ("maximum", Json::Int(i64::from(MAX_PIXEL)))])),
+            ]),
+        ),
+        ("required", Json::Arr(vec![Json::str("x"), Json::str("y")])),
+        ("additionalProperties", Json::Bool(false)),
+        ("description", Json::str(what)),
+    ])
+}
+
+/// The arguments the frame tools share: the mode, the shader filter and the cap.
+fn capture_params(args: &Json, mode: CaptureMode) -> Result<ScanParams, ToolError> {
+    let mut params = scan_params(args)?;
+    params.mode = mode;
+    params.include_uav = true;
+    params.shader_filter = string_list(args, "shader_hashes")?;
+    Ok(params)
+}
+
+fn frame_commands(shared: &Shared, args: &Json) -> Result<Json, ToolError> {
+    let mut params = capture_params(args, CaptureMode::Commands)?;
+    params.pixel = None;
+    let report = shared.capture_frame(params, shared.config.scan_timeout).map_err(ToolError::Failed)?;
+    let (path, summary) = crate::framecap::save_commands(&report, shared.shots_dir()).map_err(ToolError::Failed)?;
+    Ok(Json::obj([("path", Json::str(path.display().to_string())), ("summary", summary)]))
+}
+
+fn trace_pixel(shared: &Shared, args: &Json) -> Result<Json, ToolError> {
+    let params = capture_params(args, CaptureMode::Trace)?;
+    if params.pixel.is_none() {
+        return Err(ToolError::Args("pixel is required: an object with x and y".into()));
+    }
+    let report = shared.capture_frame(params, shared.config.scan_timeout).map_err(ToolError::Failed)?;
+    let (path, summary) = crate::framecap::save_trace(&report, shared.shots_dir()).map_err(ToolError::Failed)?;
+    Ok(Json::obj([("path", Json::str(path.display().to_string())), ("summary", summary)]))
+}
+
+fn dump_target(shared: &Shared, args: &Json) -> Result<Json, ToolError> {
+    let int = |key: &str| -> Result<Option<u32>, ToolError> {
+        match args.get(key) {
+            None | Some(Json::Null) => Ok(None),
+            Some(v) => match v.as_i64() {
+                Some(n) if (0..=i64::from(u32::MAX)).contains(&n) => Ok(Some(n as u32)),
+                _ => Err(ToolError::Args(format!("{key} must be a non-negative integer"))),
+            },
+        }
+    };
+    let after_command = int("after_command")?;
+    let after_shader = optional_str(args, "after_shader")?.filter(|h| !h.is_empty()).map(str::to_owned);
+    if after_command.is_none() == after_shader.is_none() {
+        return Err(ToolError::Args("give exactly one of after_command and after_shader".into()));
+    }
+    let resource = match optional_str(args, "resource")? {
+        None => None,
+        Some(text) => {
+            let hex = text.trim().trim_start_matches("0x").trim_start_matches("0X");
+            Some(u64::from_str_radix(hex, 16).map_err(|_| ToolError::Args("resource must be a hex address like 0x1234".into()))?)
+        }
+    };
+    let channel = optional_str(args, "channel")?.unwrap_or("rgb");
+    if !["rgb", "r", "g", "b", "a"].contains(&channel) {
+        return Err(ToolError::Args("channel must be rgb, r, g, b or a".into()));
+    }
+    let exposure = match args.get("exposure") {
+        None | Some(Json::Null) => 1.0,
+        Some(Json::Int(n)) if *n >= 0 => *n as f32,
+        Some(Json::Num(n)) if *n >= 0.0 && n.is_finite() => *n as f32,
+        Some(_) => return Err(ToolError::Args("exposure must be a number from 0".into())),
+    };
+    let mut params = ScanParams { mode: CaptureMode::Dump, include_uav: true, ..Default::default() };
+    params.dump = Some(DumpSpec {
+        after_command,
+        after_shader,
+        occurrence: int("occurrence")?.unwrap_or(0),
+        resource,
+        role: optional_str(args, "role")?.map(str::to_owned),
+        subresource: int("subresource")?.unwrap_or(0),
+    });
+    let report = shared.capture_frame(params, shared.config.scan_timeout).map_err(ToolError::Failed)?;
+    let (path, info) = crate::framecap::save_dump(&report, shared.shots_dir(), channel, exposure).map_err(ToolError::Failed)?;
+    Ok(Json::obj([("path", Json::str(path.display().to_string())), ("info", info)]))
+}
+
 fn find_bad_pixels(shared: &Shared, args: &Json) -> Result<Json, ToolError> {
     let params = scan_params(args)?;
     let (report, path, summary) = shared.find_bad_pixels(params, shared.config.scan_timeout).map_err(ToolError::Failed)?;
@@ -1236,7 +1404,7 @@ mod tests {
         let names: Vec<_> = tools.iter().filter_map(|t| t.get("name").and_then(Json::as_str)).collect();
         assert_eq!(
             names,
-            ["get_stats", "get_recent_log", "get_pipeline_events", "shader_history", "get_device_lost_report", "screenshot", "get_memory", "get_dropped_draws", "get_settings", "set_setting", "list_tunables", "get_tunable", "set_tunable", "reset_tunable", "cheat", "press", "stick", "release_all", "input_script", "find_bad_pixels", "mem_regions", "mem_scan_start", "mem_scan_filter", "mem_scan_list", "mem_read", "mem_scan_reset", "mem_watch_writes", "code_read"]
+            ["get_stats", "get_recent_log", "get_pipeline_events", "shader_history", "get_device_lost_report", "screenshot", "get_memory", "get_dropped_draws", "get_settings", "set_setting", "list_tunables", "get_tunable", "set_tunable", "reset_tunable", "cheat", "press", "stick", "release_all", "input_script", "find_bad_pixels", "frame_commands", "trace_pixel", "dump_target", "mem_regions", "mem_scan_start", "mem_scan_filter", "mem_scan_list", "mem_read", "mem_scan_reset", "mem_watch_writes", "code_read"]
         );
         for t in tools {
             let schema = t.get("inputSchema").unwrap();
@@ -1313,7 +1481,7 @@ mod tests {
             assert_eq!(error_code(&s, &call_text("find_bad_pixels", args)), INVALID_PARAMS, "{args}");
         }
         let ok = scan_params(&crate::json::parse(br#"{"max_draws":50,"pixel":{"x":960,"y":540},"include_uav":true}"#).unwrap()).ok().unwrap();
-        assert_eq!(ok, ScanParams { max_draws: 50, pixel: Some((960, 540)), include_uav: true });
+        assert_eq!(ok, ScanParams { max_draws: 50, pixel: Some((960, 540)), include_uav: true, ..Default::default() });
         let none = scan_params(&Json::Obj(vec![])).ok().unwrap();
         assert_eq!(none, ScanParams::default());
     }
