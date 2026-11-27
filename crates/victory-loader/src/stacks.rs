@@ -29,7 +29,7 @@ pub fn dump_stacks_on_schedule() {
     };
     let times = schedule(&list);
     let start = std::time::Instant::now();
-    std::thread::spawn(move || {
+    victory_core::threads::spawn("victory-stacks", move || {
         for at in times {
             std::thread::sleep(at.saturating_sub(start.elapsed()));
             dump_stacks();

@@ -1062,7 +1062,7 @@ fn start_watcher() {
     if WATCHING.swap(true, Relaxed) {
         return;
     }
-    let spawned = std::thread::Builder::new().name("victory tunables".into()).spawn(|| {
+    let spawned = std::thread::Builder::new().name("victory-tunables".into()).spawn(|| {
         loop {
             std::thread::sleep(Duration::from_millis(500));
             if DIRTY.load(Relaxed) {

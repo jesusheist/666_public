@@ -103,7 +103,7 @@ impl Port {
             // The worker ends once it holds the last reference (every queue
             // using the port is closed) and nothing is left to run.
             let worker = port.clone();
-            std::thread::spawn(move || {
+            victory_core::threads::spawn("victory-xasync-port", move || {
                 loop {
                     match worker.take(1000, || false) {
                         Some(task) => task.run(false),
@@ -166,7 +166,7 @@ impl Pool {
         let mut state = lock(&self.state);
         state.0.push_back(task);
         if state.0.len() > state.1 {
-            std::thread::spawn(move || self.work());
+            victory_core::threads::spawn("victory-xasync-work", move || self.work());
         } else {
             self.ready.notify_one();
         }
@@ -234,7 +234,7 @@ impl Queue {
             delayed.insert(id, task);
         }
         let queue = self.clone();
-        std::thread::spawn(move || {
+        victory_core::threads::spawn("victory-xasync-delay", move || {
             std::thread::sleep(Duration::from_millis(delay_ms.into()));
             // Gone if the queue was terminated meanwhile, which canceled it.
             let task = lock(&queue.delayed).remove(&id);
@@ -853,7 +853,7 @@ pub fn pending_with(
                 // SAFETY: as above; cleanup waits for completion.
                 let work = unsafe { &*state }.lock().unwrap_or_else(|e| e.into_inner()).0.take();
                 let (block, state) = (data.block as usize, state as usize);
-                std::thread::spawn(move || {
+                victory_core::threads::spawn("victory-xasync-op", move || {
                     let result = work.map_or(Err(E_ABORT), |work| work());
                     let (hr, len) = match &result {
                         Ok(bytes) => (S_OK, bytes.len()),

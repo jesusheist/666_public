@@ -107,7 +107,7 @@ extern "C" fn detach_all() {
     // needs the heap and the log writer's lock.
     // Its thread id, set when it runs its own code; 0 until then.
     static WATCHDOG: AtomicU32 = AtomicU32::new(0);
-    drop(std::thread::spawn(|| {
+    drop(victory_core::threads::spawn("victory-watchdog", || {
         // SAFETY: a plain query of the calling thread.
         let id = unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() };
         WATCHDOG.store(id, Ordering::SeqCst);

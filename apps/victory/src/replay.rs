@@ -474,7 +474,7 @@ fn retranslate(folder: &std::path::Path, into: &std::path::Path, view_limit: u32
     let started = std::time::Instant::now();
     std::thread::scope(|s| {
         for _ in 0..std::thread::available_parallelism().map_or(4, |n| n.get()) {
-            s.spawn(|| {
+            victory_core::threads::scoped(s, "victory-replay", || {
                 while let Some((stage, hash)) = all.get(next.fetch_add(1, Ordering::Relaxed)) {
                     let Ok(bytes) = std::fs::read(kept.join(format!("{hash}.cdxil"))) else { continue };
                     match victory_shader::emit::translate(&bytes) {

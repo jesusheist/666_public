@@ -193,7 +193,7 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()>
             let next = AtomicUsize::new(0);
             std::thread::scope(|s| {
                 for _ in 0..threads.min(jobs.len()) {
-                    s.spawn(|| {
+                    victory_core::threads::scoped(s, "victory-translate", || {
                         while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
                             let Some(bytes) = job.bytes() else {
                                 continue;
@@ -290,7 +290,7 @@ pub fn run(
             let next = AtomicUsize::new(0);
             std::thread::scope(|s| {
                 for _ in 0..threads.min(jobs.len()) {
-                    s.spawn(|| {
+                    victory_core::threads::scoped(s, "victory-translate", || {
                         let mut t = Tally {
                             list,
                             ..Tally::default()
@@ -450,7 +450,7 @@ pub fn precompile_with(
             let next = AtomicUsize::new(0);
             std::thread::scope(|s| {
                 for _ in 0..threads.min(jobs.len()) {
-                    s.spawn(|| {
+                    victory_core::threads::scoped(s, "victory-translate", || {
                         while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
                             let Some(bytes) = job.bytes() else { continue };
                             let hash = blake3::hash(&bytes);

@@ -562,7 +562,7 @@ impl Player {
             std::sync::Mutex::new(vec![Vec::new(); reader.parts.len()]);
         std::thread::scope(|scope| {
             for _ in 0..16 {
-                scope.spawn(|| {
+                victory_core::threads::scoped(scope, "victory-replay-diverge", || {
                     while let Some((i, p)) = {
                         let i = next.fetch_add(1, Ordering::Relaxed);
                         reader.parts.get(i).map(|p| (i, p))

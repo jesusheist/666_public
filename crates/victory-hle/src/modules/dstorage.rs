@@ -633,7 +633,7 @@ fn scheduler() -> Option<&'static Scheduler> {
         let started = (0..workers)
             .filter(|i| {
                 std::thread::Builder::new()
-                    .name(format!("dstorage {i}"))
+                    .name(format!("victory-dstorage-{i}"))
                     .spawn(|| work(scheduler))
                     .is_ok()
             })
@@ -714,7 +714,7 @@ pub(crate) mod stream_log {
         LOG.get_or_init(|| {
             let path = std::env::var_os("VICTORY_DSTORAGE_LOG")?;
             let file = std::fs::File::create(&path).ok()?;
-            std::thread::spawn(|| {
+            victory_core::threads::spawn("victory-dstorage-log", || {
                 loop {
                     std::thread::sleep(std::time::Duration::from_secs(1));
                     if let Some(costs) = super::super::xmem::map_costs() {

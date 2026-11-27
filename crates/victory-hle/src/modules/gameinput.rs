@@ -506,7 +506,7 @@ impl Hub {
     ) -> &'static Hub {
         let hub = Hub::new(source, one_pad(), counts, settings);
         hub.poll();
-        std::thread::spawn(move || {
+        victory_core::threads::spawn("victory-pad-poll", move || {
             loop {
                 std::thread::sleep(POLL);
                 hub.poll();

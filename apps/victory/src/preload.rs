@@ -166,7 +166,7 @@ pub(crate) fn run(a: Args) -> Result<()> {
 /// The worker for while the game runs.
 fn background(shaders_done: bool) -> Result<()> {
     // Ends with the game: its end closes this input.
-    std::thread::spawn(|| {
+    victory_core::threads::spawn("victory-preload-bg", || {
         let mut sink = Vec::new();
         let _ = std::io::Read::read_to_end(&mut std::io::stdin(), &mut sink);
         std::process::exit(0);
@@ -236,7 +236,7 @@ fn screen(exe: &Path, wait: bool, status: Status) -> bool {
     let Some(out) = worker.stdout.take() else { return true };
     let ended = Arc::new(AtomicBool::new(false));
     let (reader_progress, reader_ended) = (progress.clone(), ended.clone());
-    std::thread::spawn(move || {
+    victory_core::threads::spawn("victory-preload-read", move || {
         for line in BufReader::new(out).lines().map_while(Result::ok) {
             if let Some(event) = Event::parse(&line) {
                 reader_progress.lock().unwrap_or_else(|e| e.into_inner()).apply(&event, began.elapsed().as_secs_f64());

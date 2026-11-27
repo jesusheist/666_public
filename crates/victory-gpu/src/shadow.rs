@@ -1482,7 +1482,7 @@ unsafe fn copy_wide(src: *const u8, dst: *mut u8, len: usize) {
         for i in 0..threads {
             let at = (i * each).min(len);
             let n = each.min(len - at);
-            s.spawn(move || {
+            victory_core::threads::scoped(s, "victory-copy-wide", move || {
                 // SAFETY: a part of the caller's ranges.
                 unsafe { std::ptr::copy_nonoverlapping((src + at) as *const u8, (dst + at) as *mut u8, n) };
             });
@@ -3573,7 +3573,7 @@ impl Shadow {
             let parts: Vec<_> = (0..threads)
                 .map(|i| {
                     let (a, b) = (cut(i), cut(i + 1));
-                    s.spawn(move || scan(a, b))
+                    victory_core::threads::scoped(s, "victory-differ", move || scan(a, b))
                 })
                 .collect();
             parts

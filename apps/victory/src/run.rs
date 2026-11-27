@@ -428,7 +428,7 @@ fn watch(base: usize, size: usize) {
         .filter_map(|r| usize::from_str_radix(r.trim().trim_start_matches("0x"), 16).ok())
         .filter(|&rva| rva + 4 <= size)
         .collect();
-    std::thread::spawn(move || {
+    victory_core::threads::spawn("victory-run-watch", move || {
         let mut seen = vec![None; rvas.len()];
         loop {
             for (&rva, seen) in rvas.iter().zip(&mut seen) {
@@ -457,7 +457,7 @@ fn timers(base: usize, size: usize) {
     if TIMERS.iter().chain([&FRAME_US, &LIMITER_ON]).any(|&rva| rva + 0x14 > size) {
         return;
     }
-    std::thread::spawn(move || {
+    victory_core::threads::spawn("victory-run-timers", move || {
         let start = std::time::Instant::now();
         let u32_at = |rva: usize| {
             // SAFETY: inside the mapped image (checked above), title data.
@@ -501,7 +501,7 @@ fn poke(base: usize, size: usize) {
         .filter_map(|(rva, byte)| Some((hex(rva)?, u8::try_from(hex(byte)?).ok()?)))
         .filter(|&(rva, _)| rva < size)
         .collect();
-    std::thread::spawn(move || {
+    victory_core::threads::spawn("victory-run-poke", move || {
         loop {
             for &(rva, byte) in &pokes {
                 // SAFETY: a byte inside the mapped image, checked above.

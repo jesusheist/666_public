@@ -102,7 +102,7 @@ pub(crate) fn frame() {
         ON.store(false, Relaxed);
         let records = std::mem::take(&mut *BOOK.lock().unwrap_or_else(|e| e.into_inner()));
         let file = format!("{file}.{}.bin", MADE.fetch_add(1, Relaxed));
-        std::thread::spawn(move || {
+        victory_core::threads::spawn("victory-faultbook", move || {
             // SAFETY: plain data, every byte of it written.
             let bytes = unsafe { std::slice::from_raw_parts(records.as_ptr().cast::<u8>(), size_of_val(&records[..])) };
             match std::fs::write(&file, bytes) {

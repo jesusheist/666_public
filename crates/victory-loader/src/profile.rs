@@ -66,7 +66,7 @@ pub fn profile_on_schedule(phase: fn() -> u32) {
     };
     let start = Instant::now();
     let all: Vec<_> = list.split(';').filter_map(asked).collect();
-    std::thread::spawn(move || {
+    victory_core::threads::spawn("victory-profile", move || {
         for one in all {
             profile(one, start, phase);
         }

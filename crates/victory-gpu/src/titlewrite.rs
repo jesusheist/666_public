@@ -252,7 +252,7 @@ fn learn(rip: usize, same: bool, can_look: bool) {
         return;
     };
     // (Not here, under a fault of the title's.)
-    std::thread::spawn(move || {
+    victory_core::threads::spawn("victory-titlewrite", move || {
         let Some((image, offset)) = place(rip) else {
             return;
         };

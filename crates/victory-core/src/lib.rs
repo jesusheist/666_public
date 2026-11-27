@@ -14,6 +14,7 @@ pub mod logging;
 pub mod policy;
 pub mod preload;
 pub mod story_clock;
+pub mod threads;
 pub mod tunables;
 
 pub use config::Config;

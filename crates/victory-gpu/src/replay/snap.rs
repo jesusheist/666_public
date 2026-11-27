@@ -556,7 +556,7 @@ impl Capture {
             for _ in 0..stagings.len() {
                 let (work, free, maps, file, end, contents, failed) =
                     (&work, free.clone(), &maps, &file, &end, &contents, &failed);
-                scope.spawn(move || {
+                victory_core::threads::scoped(scope, "victory-snap-read", move || {
                     loop {
                         let next = lock(work).recv();
                         let Ok((i, pieces)) = next else { break };
@@ -744,7 +744,7 @@ impl Capture {
         let (buffers, file, end) = (&self.buffers, &self.deltas, &self.delta_at);
         std::thread::scope(|scope| {
             for _ in 0..threads {
-                scope.spawn(|| {
+                victory_core::threads::scoped(scope, "victory-snap-delta", || {
                     let mut mine = Vec::new();
                     loop {
                         let i = next.fetch_add(1, Ordering::Relaxed);

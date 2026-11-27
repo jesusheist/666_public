@@ -936,7 +936,7 @@ impl Player {
         let (swapped, kept) = (AtomicUsize::new(0), AtomicUsize::new(0));
         std::thread::scope(|scope| {
             for _ in 0..threads {
-                scope.spawn(|| {
+                victory_core::threads::scoped(scope, "victory-replay-swap", || {
                     while let Some(p) = frame.pipelines.get(next.fetch_add(1, Ordering::Relaxed)) {
                         let recorded = |i: u32| {
                             let c = frame.codes.get(i as usize)?;
@@ -1400,7 +1400,7 @@ impl Player {
             let failed: std::sync::Mutex<Option<std::io::Error>> = std::sync::Mutex::default();
             std::thread::scope(|scope| {
                 for _ in 0..8.min(batch.len()) {
-                    scope.spawn(|| {
+                    victory_core::threads::scoped(scope, "victory-replay-read", || {
                         while let Some(&(i, at)) = batch.get(next.fetch_add(1, Ordering::Relaxed)) {
                             let (_, len, from) = &parts[i];
                             // SAFETY: this part's own bytes of the mapping.

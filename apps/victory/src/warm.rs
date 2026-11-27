@@ -108,7 +108,7 @@ pub fn run_with(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bo
     let bad_out = Mutex::new(std::fs::OpenOptions::new().create(true).append(true).open(&bad_file)?);
     std::thread::scope(|s| {
         for _ in 0..jobs.min(chunks.len()) {
-            s.spawn(|| {
+            victory_core::threads::scoped(s, "victory-warm", || {
                 while let Some(&chunk) = chunks.get(next.fetch_add(1, Ordering::Relaxed)) {
                     let mut rest = chunk;
                     while !rest.is_empty() && !options.stop.is_some_and(|stop| stop()) {
@@ -188,7 +188,7 @@ fn child(these: &[usize], priority: u32, mut each: impl FnMut(usize, f64, bool))
     let hung = AtomicBool::new(false);
     let mut made = 0;
     std::thread::scope(|s| {
-        s.spawn(|| {
+        victory_core::threads::scoped(s, "victory-warm-watch", || {
             while !over.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(500));
                 if lock(&heard).elapsed() > LONGEST {

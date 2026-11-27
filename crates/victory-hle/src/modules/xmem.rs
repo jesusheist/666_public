@@ -1865,7 +1865,7 @@ mod pool {
         let pool = POOL.get_or_init(|| Pool { batches: Mutex::default(), more: Condvar::new() });
         STARTED.call_once(|| {
             let started = (1..super::asked_threads().unwrap_or(super::WIDE).max(side_by_side()))
-                .filter(|i| std::thread::Builder::new().name(format!("mapping {i}")).spawn(|| serve(pool)).is_ok())
+                .filter(|i| std::thread::Builder::new().name(format!("victory-mapping-{i}")).spawn(|| serve(pool)).is_ok())
                 .count();
             tracing::info!(started, "threads that map pages side by side (VICTORY_MAP_THREADS=1: none)");
         });
