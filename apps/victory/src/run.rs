@@ -321,7 +321,12 @@ pub fn run(
     }
     if victory_hle::modules::controls::mapped_input_enabled() {
         let build = victory_game::identify(hash.as_str());
-        if std::env::var_os("VICTORY_AUTO_VEHICLE").is_some_and(|value| value == "1") {
+        let flag = std::env::var("VICTORY_VEHICLE_FLAG").unwrap_or_default();
+        let flag_set = !matches!(flag.trim().to_ascii_lowercase().as_str(), "" | "off" | "none");
+        if flag_set {
+            // The layout follows the title's byte named there; VICTORY_AUTO_VEHICLE is only its fallback.
+            println!("controls       vehicle layout follows VICTORY_VEHICLE_FLAG={}", flag.trim());
+        } else if std::env::var_os("VICTORY_AUTO_VEHICLE").is_some_and(|value| value == "1") {
             if let Some(build) = build.filter(|build| build.vehicle_flag < image.info().size_of_image) {
                 victory_hle::modules::controls::set_vehicle_flag(image.base() + build.vehicle_flag as usize);
                 println!("controls       automatic vehicle layout enabled");

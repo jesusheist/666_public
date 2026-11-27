@@ -1070,6 +1070,16 @@ mod tests {
             let mut v = page.view(readouts.fps, readouts.frame_ms);
             v.note = "Space was Jump, which now has no key there".to_owned();
             save("controls", &paint(&mut text, &v, scale));
+            std::fs::copy(dir.join("menu-controls.png"), dir.join("controls-page.png")).unwrap();
+            // The options section: three Page Downs from ON FOOT, then the sensitivity line.
+            page.cancel_capture();
+            for _ in 0..3 {
+                page.section(1);
+            }
+            for _ in 0..4 {
+                page.step(Action::Down);
+            }
+            save("controls-options", &paint(&mut text, &page.view(readouts.fps, readouts.frame_ms), scale));
             victory_core::keybinds::clear();
         }
         // The Advanced page: the whole registry, its first group.
