@@ -26,48 +26,76 @@ fn folder() -> Result<PathBuf> {
     Ok(cfg.cache_subdir("shaders")?.with_file_name("pipelines"))
 }
 
-pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, these: Option<String>) -> Result<()> {
-    let dir = folder()?;
-    if let Some(these) = these {
-        return make(&dir, &these);
+/// What a run does besides making pipelines: who is told of progress, and the
+/// priority the processes run at.
+pub struct Options<'a> {
+    /// Told after each pipeline: (made so far, to make in all).
+    pub report: Option<&'a (dyn Fn(usize, usize) + Sync)>,
+    /// Windows priority class of the processes (`0x40` idle, `0x4000` below normal).
+    pub priority: u32,
+    /// Print the summary lines.
+    pub chatty: bool,
+    /// Asked between pipelines: true ends the run (what is made stays).
+    pub stop: Option<&'a (dyn Fn() -> bool + Sync)>,
+}
+
+const IDLE_PRIORITY_CLASS: u32 = 0x40;
+
+impl Default for Options<'_> {
+    fn default() -> Self {
+        Options { report: None, priority: IDLE_PRIORITY_CLASS, chatty: true, stop: None }
     }
-    let began = Instant::now();
+}
+
+/// What a run has still to make: the translator's and the driver's fingerprint,
+/// every known key and the ones to make (see [`victory_core::preload::select_todo`]).
+pub struct Plan {
+    pub dir: PathBuf,
+    pub fingerprint: String,
+    pub keys: Vec<String>,
+    pub todo: Vec<usize>,
+    pub made_before: usize,
+    pub bad: usize,
+}
+
+/// Reads the cache's lists. Makes the host device (the fingerprint holds the
+/// driver's), so a launcher asks a process of its own for this.
+pub fn plan(limit: Option<usize>, again: bool, used: bool) -> Result<Plan> {
+    let dir = folder()?;
     victory_hle::known_pipelines::use_translations(dir.with_file_name("shaders"));
     let fingerprint = known::fingerprint();
+    let keys = known::keys(&dir);
+    let read = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap_or_default();
+    let (listed, bad, early) = (read("warm-done.txt"), read("warm-bad.txt"), read("early-pipelines.txt"));
+    let todo = victory_core::preload::select_todo(&keys, &listed, &bad, &early, &fingerprint, again, used, limit);
+    let made_before = victory_core::preload::done_keys(&listed, &fingerprint).len();
+    let bad = bad.lines().filter_map(|l| l.split(' ').next()).collect::<HashSet<_>>().len();
+    Ok(Plan { dir, fingerprint, keys, todo, made_before, bad })
+}
+
+pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, these: Option<String>) -> Result<()> {
+    if let Some(these) = these {
+        return make(&folder()?, &these);
+    }
+    run_with(jobs, limit, again, used, &Options::default())
+}
+
+/// [`run`] with `options`.
+pub fn run_with(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, options: &Options) -> Result<()> {
+    let began = Instant::now();
+    let Plan { dir, fingerprint, keys, todo: all, made_before, bad } = plan(limit, again, used)?;
     let done_file = dir.join("warm-done.txt");
     let bad_file = dir.join("warm-bad.txt");
-    let keys = known::keys(&dir);
-    let listed = std::fs::read_to_string(&done_file).unwrap_or_default();
-    let mut done: HashSet<&str> = HashSet::new();
-    for line in listed.lines() {
-        if let Some((of, key)) = line.split_once(' ')
-            && of == fingerprint
-        {
-            done.insert(key);
-        }
-    }
-    let bad = std::fs::read_to_string(&bad_file).unwrap_or_default();
-    let bad: HashSet<&str> = bad.lines().filter_map(|l| l.split(' ').next()).collect();
-    let early = std::fs::read_to_string(dir.join("early-pipelines.txt")).unwrap_or_default();
-    let early: HashSet<&str> = early.lines().collect();
-    // Those earlier runs drew with first, the others in no order (by key).
-    let mut all: Vec<usize> = (0..keys.len())
-        .filter(|&n| {
-            let key = keys[n].as_str();
-            (again || !done.contains(key)) && !bad.contains(key) && (!used || early.contains(key))
-        })
-        .collect();
-    all.sort_by_key(|&n| (!early.contains(keys[n].as_str()), &keys[n]));
-    all.truncate(limit.unwrap_or(usize::MAX));
     let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
     let jobs = jobs.unwrap_or(cores * 2 / 3).max(1);
-    println!(
-        "{} pipelines known, {} made before ({fingerprint}), {} bad; {} to make, {jobs} processes",
-        keys.len(),
-        done.len(),
-        bad.len(),
-        all.len()
-    );
+    if options.chatty {
+        println!(
+            "{} pipelines known, {} made before ({fingerprint}), {bad} bad; {} to make, {jobs} processes",
+            keys.len(),
+            made_before,
+            all.len()
+        );
+    }
     let chunks: Vec<&[usize]> = all.chunks(AT_ONCE).collect();
     let next = AtomicUsize::new(0);
     let state = Mutex::new((Vec::<f64>::new(), 0usize, 0usize));
@@ -80,8 +108,8 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
             s.spawn(|| {
                 while let Some(&chunk) = chunks.get(next.fetch_add(1, Ordering::Relaxed)) {
                     let mut rest = chunk;
-                    while !rest.is_empty() {
-                        let (made, ended) = child(rest, |n, ms, there| {
+                    while !rest.is_empty() && !options.stop.is_some_and(|stop| stop()) {
+                        let (made, ended) = child(rest, options.priority, |n, ms, there| {
                             if ms >= SLOW_MS {
                                 let _ = writeln!(lock(&slow_out), "\n{} {ms:.0}", keys[n]);
                             }
@@ -89,7 +117,10 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
                             state.0.push(ms);
                             state.1 += usize::from(!there);
                             let count = state.0.len();
-                            if count % 1000 == 0 {
+                            if let Some(report) = options.report {
+                                report(count, all.len());
+                            }
+                            if options.chatty && count % 1000 == 0 {
                                 println!("{count} of {}, {:.0} s", all.len(), began.elapsed().as_secs_f64());
                             }
                             drop(state);
@@ -112,6 +143,9 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
         }
     });
     let (mut times, refused, crashed) = state.into_inner().unwrap_or_else(|e| e.into_inner());
+    if !options.chatty {
+        return Ok(());
+    }
     times.sort_by(f64::total_cmp);
     let at = |q: f64| times.get((times.len() as f64 * q) as usize).copied().unwrap_or(0.0);
     println!(
@@ -132,17 +166,16 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 /// Has a process make `these`; how many it made, and how it ended if not well.
-fn child(these: &[usize], mut each: impl FnMut(usize, f64, bool)) -> (usize, Option<String>) {
+fn child(these: &[usize], priority: u32, mut each: impl FnMut(usize, f64, bool)) -> (usize, Option<String>) {
     let list: Vec<String> = these.iter().map(usize::to_string).collect();
     let spawned = std::env::current_exe().and_then(|exe| {
         use std::os::windows::process::CommandExt;
-        const IDLE_PRIORITY_CLASS: u32 = 0x40;
         Command::new(exe)
             .args(["warm", "--these", &list.join(",")])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
-            .creation_flags(IDLE_PRIORITY_CLASS)
+            .creation_flags(priority)
             .spawn()
     });
     let Ok(mut process) = spawned else { return (these.len(), None) };

@@ -395,18 +395,52 @@ pub fn run(
 
 /// Every shader found into the cache runs translate from.
 pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>) -> Result<()> {
+    precompile_with(paths, jobs, true, None, None).map(|_| ())
+}
+
+/// The bytes of the files [`precompile_with`] goes through (the progress bar's total).
+pub fn precompile_total(paths: &[PathBuf]) -> u64 {
+    paths
+        .iter()
+        .flat_map(|root| walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok))
+        .filter(|e| e.file_type().is_file())
+        .filter_map(|e| e.metadata().ok())
+        .map(|m| m.len())
+        .filter(|&len| len <= MAX_FILE)
+        .sum()
+}
+
+/// [`precompile`] with progress: `report(bytes of files gone through, their
+/// total, shaders in the cache so far)` after each file; `stop` is asked
+/// between files and true ends the walk (the cache keeps what is made). Returns
+/// whether the walk went through every file.
+pub fn precompile_with(
+    paths: Vec<PathBuf>,
+    jobs: Option<usize>,
+    chatty: bool,
+    report: Option<&(dyn Fn(u64, u64, u64) + Sync)>,
+    stop: Option<&(dyn Fn() -> bool + Sync)>,
+) -> Result<bool> {
     let cfg = victory_core::Config::load()?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let paths = crate::default_paths(paths)?;
     let threads =
         jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
+    let total = if report.is_some() { precompile_total(&paths) } else { 0 };
+    let mut gone = 0u64;
     let started = std::time::Instant::now();
     let seen = Mutex::new(HashSet::new());
     let done = AtomicUsize::new(0);
     let failed = Mutex::new(BTreeMap::<String, (usize, String)>::new());
-    for root in &paths {
+    let mut whole = true;
+    'walk: for root in &paths {
         for entry in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
-            if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
+            if stop.is_some_and(|stop| stop()) {
+                whole = false;
+                break 'walk;
+            }
+            let len = entry.metadata().map_or(0, |m| m.len());
+            if !entry.file_type().is_file() || len > MAX_FILE {
                 continue;
             }
             let Ok(data) = std::fs::read(entry.path()) else {
@@ -426,7 +460,7 @@ pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>) -> Result<()> {
                             match victory_hle::modules::d3d12x::precompile(&bytes) {
                                 Ok(_) => {
                                     let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-                                    if n.is_multiple_of(1000) {
+                                    if chatty && n.is_multiple_of(1000) {
                                         println!("{n} shaders in the cache, {:.0} s", started.elapsed().as_secs_f64());
                                     }
                                 }
@@ -439,19 +473,25 @@ pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>) -> Result<()> {
                     });
                 }
             });
+            gone += len;
+            if let Some(report) = report {
+                report(gone, total, done.load(Ordering::Relaxed) as u64);
+            }
         }
     }
     let failed = failed.into_inner().unwrap_or_else(|e| e.into_inner());
-    println!(
-        "{} shaders in the cache, {} do not translate, {:.0} s",
-        done.load(Ordering::Relaxed),
-        failed.values().map(|f| f.0).sum::<usize>(),
-        started.elapsed().as_secs_f64()
-    );
-    for (why, (n, hash)) in failed {
-        println!("  {n:>5}  {why}  (e.g. {hash})");
+    if chatty {
+        println!(
+            "{} shaders in the cache, {} do not translate, {:.0} s",
+            done.load(Ordering::Relaxed),
+            failed.values().map(|f| f.0).sum::<usize>(),
+            started.elapsed().as_secs_f64()
+        );
+        for (why, (n, hash)) in failed {
+            println!("  {n:>5}  {why}  (e.g. {hash})");
+        }
     }
-    Ok(())
+    Ok(whole)
 }
 
 fn translate(
