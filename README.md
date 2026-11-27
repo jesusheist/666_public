@@ -1,5 +1,16 @@
 # 666
 
+**Branch `hotswap`**: changing the runtime while the game runs.
+
+What works now: every `VICTORY_...` switch in the registry (`crates/victory-core/src/tunables`) has a
+class. **Safe** switches change at once, **next frame** ones at the start of the next frame, and **restart**
+ones only at launch. Change them over MCP (`list_tunables`, `get_tunable`, `set_tunable`,
+`reset_tunable`) or on the F10 menu's Live settings page. Values set live are saved to
+`victory-live.toml` beside the data folder; an environment variable still wins over the file.
+
+Next on this branch: a soft reload (the title's state restarted without closing the program), a fast
+restart (intro skipped, save loaded), and swapping a code module while the game runs.
+
 A fork of the VIctory runtime (by way of cool_fox) that plays the Xbox Series build
 of the title on a Windows PC. The focus here is playing it with a keyboard and
 mouse, plus tools to find what the title keeps in memory.
