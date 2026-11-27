@@ -231,13 +231,7 @@ extern "system" fn create_queue(
 /// enough staging headroom (default 256 MiB) so multi-MB RPF chunks don't
 /// starve the remaining cores.
 extern "system" fn set_staging_buffer_size(_: Factory, size: u32) -> HRESULT {
-    static FLOOR_MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let floor = *FLOOR_MB.get_or_init(|| {
-        std::env::var("VICTORY_DSTORAGE_STAGING_MB")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(256)
-    }) << 20;
+    let floor = (victory_gpu::tunables::known::DSTORAGE_STAGING_MB.get() as u64) << 20;
     tracing::info!(size, floor, "dstorage: staging buffer size");
     if let Some(scheduler) = scheduler() {
         scheduler.lock().staging = u64::from(size).max(floor);
@@ -298,11 +292,11 @@ impl Io {
     fn chosen() -> Io {
         static CHOSEN: OnceLock<Io> = OnceLock::new();
         *CHOSEN.get_or_init(|| {
-            let io = match std::env::var("VICTORY_DSTORAGE_IO").as_deref().map(str::trim) {
-                Ok("one") => Io::One,
-                Ok("handles") => Io::Handles,
-                Ok("overlapped") => Io::Overlapped,
-                Ok("direct") => Io::Direct,
+            let io = match victory_gpu::tunables::known::DSTORAGE_IO.get_str() {
+                "one" => Io::One,
+                "handles" => Io::Handles,
+                "overlapped" => Io::Overlapped,
+                "direct" => Io::Direct,
                 _ => Io::DEFAULT,
             };
             tracing::info!(?io, "dstorage: how files are read (VICTORY_DSTORAGE_IO)");
@@ -654,10 +648,7 @@ impl Scheduler {
 /// list of a launch's reads, by file and offset, is what a launch with the
 /// first room's walls and one without are compared by).
 fn walls_trace() -> u8 {
-    static ON: OnceLock<u8> = OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("VICTORY_WALLS_TRACE").ok().and_then(|v| v.trim().parse::<u8>().ok()).unwrap_or(0)
-    })
+    victory_gpu::tunables::known::WALLS_TRACE.get() as u8
 }
 
 /// The files opened, by the address of our file object, with their paths
@@ -1052,10 +1043,7 @@ struct Read {
 /// pages' mapping, changed when it should not have, or whose bytes another
 /// running request writes too; 2: a line for every request.
 fn trace() -> u8 {
-    static ON: OnceLock<u8> = OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("VICTORY_DSTORAGE_TRACE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
-    })
+    victory_gpu::tunables::known::DSTORAGE_TRACE.get() as u8
 }
 
 /// When a request was enqueued and submitted, and what its page list held
@@ -1301,8 +1289,7 @@ extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
 /// data went into whatever those pages belonged to by then, and the pages it
 /// was for stayed as they were.
 fn half_submits() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_DSTORAGE_HALF").is_some_and(|v| v == "1"))
+    victory_gpu::tunables::known::DSTORAGE_HALF.get()
 }
 
 /// Adds a command to the queue; blocks while the queue is full. A queue
@@ -1662,10 +1649,7 @@ fn into_pages(
     // or address space short while a load maps many at once), can come right a little
     // later: tried again before the request fails (`VICTORY_DSTORAGE_RETRIES`, default 12,
     // about 1.5 s in all).
-    static RETRIES: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    let retries = *RETRIES.get_or_init(|| {
-        std::env::var("VICTORY_DSTORAGE_RETRIES").ok().and_then(|v| v.parse().ok()).unwrap_or(12)
-    });
+    let retries = victory_gpu::tunables::known::DSTORAGE_RETRIES.get() as u32;
     let mut written = super::xmem::write_physical(pages, offset, &data[..n]);
     let mut tries = 0;
     while !written && tries < retries {

@@ -11,6 +11,8 @@ static MAIN_IMAGE_BASE: AtomicUsize = AtomicUsize::new(0);
 pub fn set_main_image(base: usize) {
     MAIN_IMAGE_BASE.store(base, Ordering::Release);
     crate::image_watch::start(base);
+    #[cfg(windows)]
+    crate::memscan::init();
 }
 
 pub fn main_image() -> Option<usize> {
@@ -248,7 +250,7 @@ pub fn use_console_timers() {
     // when its window is not the one in front, as while its owner works in
     // another window or streams. The console has eight cores alike and no
     // such mode. `VICTORY_EFFICIENCY_MODE=1` leaves the system its choice.
-    let execution = if std::env::var_os("VICTORY_EFFICIENCY_MODE").is_some_and(|v| v == "1") {
+    let execution = if victory_gpu::tunables::known::EFFICIENCY_MODE.get() {
         0
     } else {
         PROCESS_POWER_THROTTLING_EXECUTION_SPEED

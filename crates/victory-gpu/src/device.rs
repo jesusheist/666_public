@@ -406,6 +406,7 @@ extern "system" fn removed_reason(_: This) -> HRESULT {
     if let Some(host) = crate::host::host() {
         // SAFETY: a plain query.
         if let Err(e) = unsafe { host.device.GetDeviceRemovedReason() } {
+            victory_core::logging::device_removed();
             return e.code().0;
         }
     }

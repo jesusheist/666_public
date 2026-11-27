@@ -22,6 +22,7 @@ victory-shader = { path = "crates/victory-shader" }
 victory-formats = { path = "crates/victory-formats" }
 victory-pipeline = { path = "crates/victory-pipeline" }
 victory-game = { path = "crates/victory-game" }
+victory-mcp = { path = "crates/victory-mcp" }
 
 # External crates
 anyhow = "1.0.104"
@@ -71,6 +72,14 @@ opt-level = 2
 
 [profile.release]
 debug = "line-tables-only"
+
+# Slower build with thin LTO and one codegen unit (the port spends its time
+# hashing, copying and translating, so cross-crate inlining may pay):
+# `cargo build --profile release-lto`. Plain `--release` stays as it was.
+[profile.release-lto]
+inherits = "release"
+lto = "thin"
+codegen-units = 1
 
 # The development build: release code generation plus the `diagnostics`
 # feature (`cargo build --profile diag -p victory --features diagnostics`),

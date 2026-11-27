@@ -815,8 +815,7 @@ const SIZES: usize = usize::MAX - (9 << 33);
 /// asked for two frames earlier and landed in that frame, none of those with
 /// the right size.
 fn sizes_wait() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_SIZES_WAIT").is_some_and(|v| v == "1"))
+    victory_core::tunables::known::BVH_SIZES_WAIT.get()
 }
 
 /// Whether a dispatch of the builder is its program of a structure's size:
@@ -1087,8 +1086,7 @@ mod trace {
     }
 
     fn on() -> bool {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_TRACE").is_some_and(|v| v == "1"))
+        victory_core::tunables::known::BVH_TRACE.get()
     }
 
     fn value(at: u64) -> u64 {

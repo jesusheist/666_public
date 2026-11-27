@@ -110,6 +110,9 @@ struct Last {
     /// first checks, and after the hash found a change the guard had not
     /// seen ([`hot_textures`]). 0: not checked under the guard yet.
     hot_until: u64,
+    /// The frame it was read in ahead of its submission
+    /// ([`Staging::refresh_ahead`]).
+    ahead: Option<u64>,
 }
 
 /// Frames a guarded texture is hashed at every check from its first check,
@@ -129,8 +132,7 @@ const HOT_FRAMES: u64 = 64;
 /// never caught changing). `VICTORY_TEXTURE_HOT=0`: every eighth frame
 /// only, as before.
 fn hot_textures() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_HOT").is_none_or(|v| v != "0"))
+    victory_core::tunables::known::TEXTURE_HOT.get()
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -372,8 +374,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
 /// yet is filled with what is there all the same ([`fill_unlocked`]): a list
 /// has recorded the upload from it by then.
 fn no_wait() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_NO_WAIT").is_some_and(|v| v == "1"))
+    victory_core::tunables::known::TEXTURE_NO_WAIT.get()
 }
 
 /// Whether a refresh that does not wait ([`no_wait`]) and finds a page
@@ -390,8 +391,7 @@ fn no_wait() -> bool {
 /// uploads put zeros over a filled level (run pic1-1; 68,700 refreshes left
 /// in the 150 s of world of run play1).
 fn fill_unlocked() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_FILL").is_none_or(|v| v != "0"))
+    victory_core::tunables::known::TEXTURE_FILL.get()
 }
 
 /// Since the last frame-rate line, with [`no_wait`]: refreshes that read
@@ -454,8 +454,7 @@ fn with_read<R>(size: usize, f: impl FnOnce(&mut [u8]) -> R) -> R {
 /// another reason (`crate::watch::title_memory_reading`); this switch is
 /// left to tell whether the copy was what lost the device.
 fn through_copy() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_COPY").is_some_and(|v| v == "1"))
+    victory_core::tunables::known::TEXTURE_COPY.get()
 }
 
 /// Calls `f` with the `size` bytes of title memory at `memory`, read
@@ -612,6 +611,13 @@ pub(crate) fn placed_in_host_written(address: u64, desc: &[u32; 14]) {
     }
 }
 
+/// Whether `[address, address + bytes)` overlaps the title memory of a
+/// texture the host copied into ([`host_written`]).
+pub(crate) fn overlaps_host_written(address: u64, bytes: u64) -> bool {
+    let map = HOST_WRITTEN_AT.lock().unwrap_or_else(|e| e.into_inner());
+    map.range(..address).next_back().is_some_and(|(at, d)| *at + d.0 > address) || map.range(address..address + bytes.max(1)).next().is_some()
+}
+
 /// Whether the host GPU wrote `resource` by a copy or resolve
 /// ([`host_written`]): its host copy cannot be made again from title
 /// memory.
@@ -673,8 +679,7 @@ thread_local! {
 /// the texture's blocks (a change of protection, under the lock every other
 /// refresh wants), and the title's next write there faults to open them.
 fn once() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_ONCE").is_none_or(|v| v != "0"))
+    victory_core::tunables::known::TEXTURE_ONCE.get()
 }
 
 /// A 128-bit digest of `bytes`, to tell a texture's memory changed: four
@@ -728,6 +733,14 @@ pub(crate) fn digest(bytes: &[u8]) -> Digest {
 /// See [`digest`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Digest(u128);
+
+#[cfg(test)]
+impl Digest {
+    /// A digest for tests that only need a copy to have been uploaded.
+    pub(crate) fn any() -> Digest {
+        Digest(1)
+    }
+}
 
 /// [`upload`] of the levels from `first` on, the ones a view shows: of a
 /// texture the title placed there may be no memory of the larger ones, and
@@ -1238,6 +1251,37 @@ impl Staging {
         preparing[3].fetch_add(read as u64, Relaxed);
     }
 
+    /// Detiles the texture memory into the staging buffer ahead of the
+    /// submission, on the thread of `crate::heap_worker`: read through the
+    /// kernel, so that the runtime's remapping never waits for it, whole or
+    /// not at all (the submission then does it, as ever). False if it was
+    /// not read. What the title writes after this is found at submission.
+    pub(crate) fn refresh_ahead(&self) -> bool {
+        let size = self.read;
+        let start = self.memory as usize;
+        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        let last = &mut *last;
+        if last.hash.is_some() || last.asked != 0 {
+            // Detiled before: the submission's check is cheap.
+            return true;
+        }
+        let asked =
+            crate::watch::writes(start, start + size, false).or_else(|| crate::watch::writes(start, start + size, true));
+        let Some((now, _)) = asked else {
+            return false;
+        };
+        with_read(size, |read| {
+            if !crate::host::read_into(self.memory, read) {
+                return false;
+            }
+            last.hash = Some(digest(read));
+            self.detile(read);
+            last.asked = now;
+            last.ahead = Some(crate::frame::current());
+            true
+        })
+    }
+
     fn movie_plane(&self) -> bool {
         use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8_UNORM;
         let desc = &self.layout.desc;
@@ -1295,11 +1339,10 @@ impl Staging {
         // the hash, which is taken every eighth frame only, by the
         // texture's address, so the textures take turns.
         // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
-        static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         // The guard saw no write: a change the hash finds came another way.
         let mut blind = false;
         if !alone
-            && *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
+            && victory_core::tunables::known::TEXTURE_GUARD.get()
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
         {
             const HASH_EVERY: u64 = 8;
@@ -1308,7 +1351,8 @@ impl Staging {
             let frame = crate::frame::current();
             let turn = frame
                 .wrapping_add((start >> 16) as u64)
-                .is_multiple_of(HASH_EVERY);
+                .is_multiple_of(HASH_EVERY)
+                && last.ahead.is_none_or(|at| frame > at + 1);
             // A texture starts hot: one written that way from its first
             // frames on changes before the hash has ever caught it.
             if last.hot_until == 0 {
@@ -1616,8 +1660,7 @@ fn staged_from(resource: This) -> u32 {
 /// byte, and a texture uploaded again costs a staging buffer, a detiling and
 /// a copy more than this look.) `VICTORY_TEXTURE_SAME=0`: not asked.
 pub(crate) fn unchanged(resource: This, first: u32) -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SAME").is_none_or(|v| v != "0")) {
+    if !victory_core::tunables::known::TEXTURE_SAME.get() {
         return false;
     }
     let Some(copy) = crate::resource::made_copy(resource) else {
@@ -1693,8 +1736,7 @@ pub(crate) fn committed(at: *const u8, len: usize) -> bool {
 /// while it ran the submitting thread's write-watch askings waited behind
 /// the walks (run 76: 8-22 askings a frame of 6-21 ms each, 46-172 ms).
 fn by_query() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_COMMITTED_QUERY").is_some_and(|v| v == "1"))
+    victory_core::tunables::known::COMMITTED_QUERY.get()
 }
 
 /// Of the kernel's pages that hold `[at, at + len)` (`len > 0`): how many
@@ -1778,8 +1820,7 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
     // knows which are there: one look, where the host was asked for every
     // 64 KiB of the texture (and once more for each that is not there).
     // `VICTORY_MAPPED_BY_VIEWS=0`: the host is asked, as before.
-    static BY_VIEWS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *BY_VIEWS.get_or_init(|| std::env::var_os("VICTORY_MAPPED_BY_VIEWS").is_none_or(|v| v != "0"))
+    if victory_core::tunables::known::MAPPED_BY_VIEWS.get()
         && let Some(there) = crate::inplace::shown_bytes(start, len)
     {
         return there;
@@ -1788,8 +1829,7 @@ pub(crate) fn mapped_bytes(at: *const u8, len: usize) -> u64 {
         return 0;
     }
     if !by_query() {
-        static BY_PAGE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *BY_PAGE.get_or_init(|| std::env::var_os("VICTORY_MAPPED_BY_PAGE").is_some_and(|v| v == "1")) {
+        if victory_core::tunables::known::MAPPED_BY_PAGE.get() {
             // By page, without the walk: whole pages, cut to the range.
             let (there, _) = readable(start, len, false);
             return (there as u64 * 4096).min(len as u64);

@@ -277,7 +277,7 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
 /// dispatch packets and group numbers are the same; D3D12 does not look at
 /// indirect counts. Other cards stay at 65,535.
 fn widest(amd: bool) -> u32 {
-    let on = std::env::var_os("VICTORY_INDIRECT_WIDE").is_none_or(|v| v != "0");
+    let on = victory_core::tunables::known::INDIRECT_WIDE.get();
     if amd && on { 1 << 20 } else { 65_535 }
 }
 
@@ -298,7 +298,7 @@ pub(crate) fn amd(device: &ID3D12Device) -> bool {
 /// (`VICTORY_INDIRECT_REST=1`; off by default so one oversized record takes
 /// nothing and later valid draws still run).
 fn rest() -> u32 {
-    u32::from(std::env::var("VICTORY_INDIRECT_REST").is_ok_and(|v| v == "1"))
+    u32::from(victory_core::tunables::known::INDIRECT_REST.get())
 }
 
 /// The clamp compiled from `source` (ours, or in the benchmark the one it

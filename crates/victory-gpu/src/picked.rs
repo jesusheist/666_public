@@ -56,12 +56,7 @@ pub(crate) fn on() -> bool {
 /// no refresh sends title memory over it while a flight may write it, and
 /// not landed), 2 (landed too).
 fn stage() -> u8 {
-    static STAGE: OnceLock<u8> = OnceLock::new();
-    *STAGE.get_or_init(|| match std::env::var("VICTORY_PICKED_WRITES").as_deref() {
-        Ok("1") => 1,
-        Ok("2") => 2,
-        _ => 0,
-    })
+    victory_core::tunables::known::PICKED_WRITES.get() as u8
 }
 
 /// Whether what is found is landed.
@@ -71,11 +66,7 @@ pub(crate) fn lands() -> bool {
 
 /// Bytes looked at in turn per frame (`VICTORY_PICKED_MB`).
 fn slice() -> u64 {
-    static SLICE: OnceLock<u64> = OnceLock::new();
-    *SLICE.get_or_init(|| {
-        let mb = std::env::var("VICTORY_PICKED_MB").ok().and_then(|v| v.trim().parse::<u64>().ok());
-        mb.unwrap_or(32) << 20
-    })
+    (victory_core::tunables::known::PICKED_MB.get() as u64) << 20
 }
 
 /// A list's key for [`HostList::first_use`]: it runs such a shader (no title

@@ -72,6 +72,8 @@ pub fn log_crash(text: &str) {
 
 fn append_to_log(text: &str) {
     use std::io::Write;
+    // The per-subject log files (VICTORY_LOG_DIR), if on.
+    victory_core::logging::crash_text(text);
     let Some(file) = LOG.get() else { return };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -92,6 +94,8 @@ pub fn note_title_output(line: &str) {
     if line.is_empty() {
         return;
     }
+    // The per-subject log files (VICTORY_LOG_DIR), if on.
+    victory_core::logging::title_line(line);
     let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
     if said.len() == SAID_LINES {
         said.pop_front();

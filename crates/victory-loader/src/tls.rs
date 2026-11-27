@@ -18,7 +18,7 @@ use windows_sys::Win32::System::Memory::{
 };
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
-const SCN_MEM_EXECUTE: u32 = 0x2000_0000;
+pub(crate) const SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 const TLS64_ADDRESS_OF_INDEX: usize = 16;
 /// `mov r64, gs:[0x58]` is `65 REX 8B ModRM 25 58 00 00 00`.
 const LOAD_LEN: usize = 9;

@@ -654,7 +654,9 @@ dependencies = [
  "tempfile",
  "thiserror",
  "toml",
+ "tracing",
  "tracing-subscriber",
+ "victory-mcp",
 ]
 
 [[package]]
@@ -666,6 +668,11 @@ name = "victory-game"
 version = "0.1.0"
 dependencies = [
  "memchr",
+ "thiserror",
+ "tracing",
+ "victory-formats",
+ "victory-loader",
+ "windows-sys",
  "zlib-rs",
 ]
 
@@ -677,7 +684,9 @@ dependencies = [
  "blake3",
  "tempfile",
  "tracing",
+ "victory-core",
  "victory-formats",
+ "victory-mcp",
  "victory-pipeline",
  "victory-shader",
  "windows",
@@ -695,6 +704,7 @@ dependencies = [
  "victory-formats",
  "victory-gpu",
  "victory-loader",
+ "victory-mcp",
  "victory-pe",
  "windows",
  "windows-core",
@@ -714,6 +724,17 @@ dependencies = [
  "victory-core",
  "victory-pe",
  "windows-sys",
+]
+
+[[package]]
+name = "victory-mcp"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "tracing",
+ "tracing-subscriber",
+ "windows-sys",
+ "zlib-rs",
 ]
 
 [[package]]
@@ -739,6 +760,7 @@ dependencies = [
 name = "victory-shader"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "thiserror",
  "windows",
  "windows-sys",

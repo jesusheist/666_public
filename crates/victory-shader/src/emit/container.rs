@@ -132,6 +132,37 @@ pub(crate) fn mesh_output_bytes(
     4 * (scalars(vertex) * align(max_vertices) + scalars(primitive) * align(max_primitives))
 }
 
+/// The largest maxima at or under `max_vertices` and `max_primitives` whose
+/// outputs fit [`MESH_OUTPUT_LIMIT`], or `None` when not even one group of 32
+/// vertices and 32 primitives does (the validator rounds both counts up to
+/// multiples of 32). Vertices come down first, in whole multiples of 32, and
+/// only for what the primitives' own outputs leave; primitives come down only
+/// when the primitive outputs alone are over the cap. A count that already
+/// fits stays as it is.
+pub(crate) fn fit_mesh_counts(
+    vertex: &[SigElement],
+    primitive: &[SigElement],
+    max_vertices: u32,
+    max_primitives: u32,
+) -> Option<(u32, u32)> {
+    let fits = |v: u32, p: u32| mesh_output_bytes(vertex, primitive, v, p) <= MESH_OUTPUT_LIMIT;
+    if fits(max_vertices, max_primitives) {
+        return Some((max_vertices, max_primitives));
+    }
+    let mut primitives = max_primitives;
+    while !fits(32.min(max_vertices), primitives) {
+        if primitives <= 32 {
+            return None;
+        }
+        primitives = ((primitives - 1) / 32 * 32).max(32);
+    }
+    let mut vertices = max_vertices;
+    while !fits(vertices, primitives) {
+        vertices = ((vertices - 1) / 32 * 32).max(32);
+    }
+    Some((vertices, primitives))
+}
+
 /// A resource bound by register, as `PSV0` lists it.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Binding {
@@ -471,6 +502,76 @@ mod tests {
         assert_eq!(recovered.iter().map(|e| e.interp).collect::<Vec<_>>(), [1, 1, 2]);
         assert!(super::super::vertex_output_interpolation(&psv[..psv.len() - 1], &mut recovered)
             .is_err());
+    }
+
+    /// `n` float elements of `cols` components each (rows are not needed).
+    fn floats(n: usize, cols: u8) -> Vec<SigElement> {
+        (0..n)
+            .map(|i| SigElement {
+                name: "TEXCOORD".into(),
+                index: i as u32,
+                kind: 0,
+                comp: 9,
+                interp: 2,
+                row: Some(i as u32),
+                col: 0,
+                cols,
+                usage: (1 << cols) - 1,
+                half: false,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn mesh_output_size_counts_components_at_counts_rounded_to_32() {
+        // The pedestrian meshes: 66 vertex scalars at 128 vertices.
+        let mut vertex = floats(16, 4);
+        vertex.extend(floats(1, 2));
+        assert_eq!(mesh_output_bytes(&vertex, &[], 128, 128), 4 * 66 * 128);
+        assert_eq!(mesh_output_bytes(&vertex, &[], 128, 128), 33792);
+        // Counts round up to multiples of 32.
+        assert_eq!(mesh_output_bytes(&vertex, &[], 97, 1), 4 * 66 * 128);
+        assert_eq!(mesh_output_bytes(&vertex, &[], 96, 1), 4 * 66 * 96);
+        // Primitive outputs count against the same cap.
+        let prim = floats(1, 4);
+        assert_eq!(
+            mesh_output_bytes(&vertex, &prim, 64, 100),
+            4 * (66 * 64 + 4 * 128)
+        );
+    }
+
+    #[test]
+    fn mesh_counts_that_fit_stay_and_the_others_come_down_to_the_cap() {
+        let mut vertex = floats(16, 4);
+        vertex.extend(floats(1, 2));
+        // 64 scalars exactly fill 32 KiB at 128 vertices.
+        let fits = floats(16, 4);
+        assert_eq!(fit_mesh_counts(&fits, &[], 128, 128), Some((128, 128)));
+        // 66 scalars do not: 96 vertices is the most that fits.
+        assert_eq!(fit_mesh_counts(&vertex, &[], 128, 128), Some((96, 128)));
+        assert_eq!(fit_mesh_counts(&vertex, &[], 256, 256), Some((96, 256)));
+        // What is fitted is under the cap, and one step more is not.
+        let (v, p) = fit_mesh_counts(&vertex, &[], 128, 128).unwrap();
+        assert!(mesh_output_bytes(&vertex, &[], v, p) <= MESH_OUTPUT_LIMIT);
+        assert!(mesh_output_bytes(&vertex, &[], v + 32, p) > MESH_OUTPUT_LIMIT);
+        // The primitives' outputs take their part first.
+        let prim = floats(4, 4);
+        let (v, p) = fit_mesh_counts(&vertex, &prim, 128, 128).unwrap();
+        assert_eq!((v, p), (64, 128));
+        assert!(mesh_output_bytes(&vertex, &prim, v, p) <= MESH_OUTPUT_LIMIT);
+    }
+
+    #[test]
+    fn mesh_counts_come_down_on_the_primitives_only_when_they_alone_pass_the_cap() {
+        // 120 primitive scalars at 128 primitives is over 32 KiB by itself.
+        let prim = floats(30, 4);
+        let vertex = floats(1, 4);
+        let (v, p) = fit_mesh_counts(&vertex, &prim, 128, 128).unwrap();
+        assert_eq!((v, p), (128, 64));
+        assert!(mesh_output_bytes(&vertex, &prim, v, p) <= MESH_OUTPUT_LIMIT);
+        assert!(mesh_output_bytes(&vertex, &prim, v, p + 32) > MESH_OUTPUT_LIMIT);
+        // Nothing fits when one group of 32 vertices is over the cap.
+        assert_eq!(fit_mesh_counts(&floats(300, 4), &[], 128, 128), None);
     }
 
     #[test]

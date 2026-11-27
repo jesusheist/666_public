@@ -10,6 +10,16 @@ publish.workspace = true
 [dependencies]
 memchr.workspace = true
 zlib-rs.workspace = true
+# The movie reader, for `prompts`.
+victory-formats.workspace = true
+
+# The hook of `prompts`: the image it is placed in, the host font, its errors
+# and its log.
+[target.'cfg(windows)'.dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+victory-loader.workspace = true
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Graphics_Gdi"] }
 
 [lints]
 workspace = true

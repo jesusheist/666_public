@@ -59,20 +59,20 @@ fn named(shaders: &[Arc<Shader>], name: &[u8]) -> bool {
 fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     static SKIP_RT_RESOLVE: OnceLock<bool> = OnceLock::new();
     let skip_rt = *SKIP_RT_RESOLVE.get_or_init(|| {
-        let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
+        let builder = victory_core::tunables::known::BVH_BUILDER.get();
         if builder {
             return false;
         }
         // Without BVH, ~1,000 CS_RaytracingResolve shaders shade no hits while
         // clogging the cold compiler queue; skip unless VICTORY_RT_RESOLVE=1.
-        std::env::var_os("VICTORY_RT_RESOLVE").is_none_or(|v| v == "0")
+        !victory_core::tunables::known::RT_RESOLVE.get()
     });
     if skip_rt && named(shaders, b"CS_RaytracingResolve") {
         return Some("shades ray-tracing hits without BVH, left out");
     }
     static SKIP_ACTIVATE_RAYS: OnceLock<bool> = OnceLock::new();
     let skip_activate = *SKIP_ACTIVATE_RAYS.get_or_init(|| {
-        let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
+        let builder = victory_core::tunables::known::BVH_BUILDER.get();
         if builder {
             return std::env::var_os("VICTORY_ACTIVATE_RAYS").is_some_and(|v| v == "0");
         }
@@ -173,6 +173,19 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
     }
 }
 
+/// For the dropped-draw report: why `p` has no host pipeline (None if it has one).
+pub(crate) fn lack(p: &Pending) -> Option<crate::droprep::Reason> {
+    use crate::droprep::Reason;
+    if p.left_out.is_some() {
+        return Some(Reason::PipelineLeftOut);
+    }
+    match p.made.get() {
+        Some(Some(_)) => None,
+        None => Some(Reason::PipelineMaking),
+        Some(None) => Some(Reason::PipelineRefused),
+    }
+}
+
 /// The hashes of the shaders `p` is made of.
 pub(crate) fn hashes(p: &Pending) -> String {
     let hashes: Vec<&str> = p.shaders.iter().map(|s| s.hash.as_str()).collect();
@@ -184,25 +197,16 @@ static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
 /// Waiting allowed per title frame, over all threads.
 fn wait_budget() -> Duration {
-    static BUDGET: OnceLock<Duration> = OnceLock::new();
-    *BUDGET.get_or_init(|| {
-        let millis = std::env::var("VICTORY_PIPELINE_WAIT_MS")
-            .ok()
-            .and_then(|value| value.trim().parse::<u64>().ok())
-            .unwrap_or(500);
-        tracing::info!(millis, "host pipeline wait budget per frame");
-        Duration::from_millis(millis)
-    })
+    let millis = victory_core::tunables::known::PIPELINE_WAIT_MS.get() as u64;
+    static SAID: std::sync::Once = std::sync::Once::new();
+    SAID.call_once(|| tracing::info!(millis, "host pipeline wait budget per frame"));
+    Duration::from_millis(millis)
 }
 
 /// As [`wait_budget`], for passes over the screen (`VICTORY_SCREEN_WAIT_MS`,
 /// 10 s; 0: like the others). Below the title's 30 s watchdog.
 fn screen_budget() -> Duration {
-    static BUDGET: OnceLock<Duration> = OnceLock::new();
-    *BUDGET.get_or_init(|| {
-        let millis = std::env::var("VICTORY_SCREEN_WAIT_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(10_000);
-        Duration::from_millis(millis)
-    })
+    Duration::from_millis(victory_core::tunables::known::SCREEN_WAIT_MS.get() as u64)
 }
 
 /// Whether passes over the screen go before the others.
@@ -231,9 +235,26 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     }
     if p.made.get().is_none() {
         start(p, REQUESTED);
-        wait(p, crate::frame::current());
+        if p.graphics.is_none() && compute_waits() {
+            // OnceLock waits for a worker already compiling this pipeline,
+            // or compiles it here if workers have not taken it yet. The
+            // frame's budget cannot discard a compute dispatch.
+            p.make();
+        } else {
+            wait(p, crate::frame::current());
+        }
     }
     p.made.get()?.as_ref()
+}
+
+/// Whether a dispatch waits for its compute pipeline until it is made,
+/// whatever the frame's budget; a draw still waits within the budget and is
+/// dropped while its pipeline is not there. A dropped draw is drawn again in
+/// the next frame; a dropped dispatch may not be (the title runs some compute
+/// passes once, when a scene changes). Off by default;
+/// `VICTORY_PIPELINE_COMPUTE_WAIT=1` turns it on.
+fn compute_waits() -> bool {
+    victory_core::tunables::known::PIPELINE_COMPUTE_WAIT.get()
 }
 
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
@@ -268,8 +289,7 @@ pub(crate) fn early(p: &Arc<Pending>) {
 /// 34-49: "2504 ms waiting for pipelines" in each such frame).
 /// On by default; `VICTORY_PIPELINE_WAIT_SHARED=0` counts as before.
 fn shared_budget() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_SHARED").is_none_or(|v| v != "0"))
+    victory_core::tunables::known::PIPELINE_WAIT_SHARED.get()
 }
 
 /// Waits for `p` while frame `frame` has budget left.
@@ -352,7 +372,7 @@ const MAKING: u8 = 3;
 fn slow_limit() -> usize {
     static LIMIT: OnceLock<usize> = OnceLock::new();
     *LIMIT.get_or_init(|| {
-        if std::env::var_os("VICTORY_PIPELINE_SLOW").is_some_and(|v| v == "0") {
+        if !victory_core::tunables::known::PIPELINE_SLOW.get() {
             usize::MAX
         } else {
             (worker_count(None, std::thread::available_parallelism().map_or(2, |n| n.get())) / 4).max(1)
@@ -489,9 +509,7 @@ fn workers() -> bool {
     *RUNNING.get_or_init(|| {
         let mut running = false;
         let workers = worker_count_for(
-            std::env::var("VICTORY_PIPELINE_WORKERS")
-                .ok()
-                .and_then(|v| v.trim().parse().ok()),
+            Some(victory_core::tunables::known::PIPELINE_WORKERS.get() as usize).filter(|&n| n > 0),
             std::thread::available_parallelism().map_or(2, |n| n.get()),
             crate::residency::limited_host_ram(),
         );
@@ -505,7 +523,7 @@ fn workers() -> bool {
                     // Below the title's own threads (loading, recording),
                     // and the streaming one, which is below normal itself
                     // (`VICTORY_PIPELINE_LOWEST=0`: level with it, as before).
-                    let lowest = !screens_only && std::env::var_os("VICTORY_PIPELINE_LOWEST").is_none_or(|v| v != "0");
+                    let lowest = !screens_only && victory_core::tunables::known::PIPELINE_LOWEST.get();
                     // SAFETY: a plain call on our own thread.
                     unsafe {
                         use windows::Win32::System::Threading::*;

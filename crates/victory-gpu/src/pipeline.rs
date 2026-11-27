@@ -61,11 +61,19 @@ pub(crate) struct Shader {
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
     container: Vec<u8>,
+    /// It animates or draws hair strands ([`hair_strands`]); left out while
+    /// `VICTORY_SKIP_HAIR` is on.
+    #[cfg(windows)]
+    hair: bool,
     /// Its part in the stand-in for the indirect light.
     #[cfg(windows)]
     pub(crate) ambient: Option<crate::ambient::Role>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+    /// A pixel shader's code made for the float targets it draws into, by
+    /// [`Shader::code_for_targets`] (`None`: it did not translate so).
+    #[cfg(windows)]
+    for_targets: Mutex<HashMap<u32, Option<Arc<Vec<u8>>>>>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -100,6 +108,47 @@ pub(crate) fn kept() -> [u64; 7] {
     ]
 }
 
+/// Whether a container's program is one of those that animate and draw hair
+/// strands, by its name. Some of them do not translate (an address from a
+/// phi) and the others draw lines all over the screen without them; whether
+/// they are left out is `VICTORY_SKIP_HAIR`, read per draw.
+#[cfg(windows)]
+fn hair_strands(container: &[u8]) -> bool {
+    const NAMES: [&[u8]; 18] = [
+        b"InterpolateStrand",
+        b"HairStrand",
+        b"CS_VisHair",
+        b"PS_Smh",
+        b"CS_InitSimBuffer",
+        b"CS_PreSkinSim",
+        b"CS_SolvePer",
+        b"CS_WavePerSpline",
+        b"CS_EstimateStartPosition",
+        b"CS_CachePrev",
+        b"CS_RestoreSimVelocity",
+        b"CS_UpdatePosePosition",
+        b"CS_GenerateAccessories",
+        b"CSGenerateHair",
+        b"CS_CalculateFireVolumes",
+        b"CS_ProjDecalCut",
+        b"CS_CullMaskPass",
+        b"CS_LodBlend",
+    ];
+    const END: &[u8] = b"_Wrapped";
+    container
+        .windows(END.len())
+        .enumerate()
+        .filter(|(_, w)| *w == END)
+        .any(|(at, _)| {
+            let before = &container[at.saturating_sub(100)..at];
+            let name = before
+                .rsplit(|b| !b.is_ascii_alphanumeric() && *b != b'_')
+                .next()
+                .unwrap_or_default();
+            NAMES.iter().any(|n| name.windows(n.len()).any(|w| w == *n))
+        })
+}
+
 /// The shared container for `bytes`.
 fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
     let full = blake3::hash(bytes);
@@ -115,12 +164,41 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 hash: full.to_hex()[..16].to_owned(),
                 container: bytes.to_vec(),
                 #[cfg(windows)]
+                hair: hair_strands(bytes),
+                #[cfg(windows)]
                 ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
+                #[cfg(windows)]
+                for_targets: Mutex::new(HashMap::new()),
             })
         })
         .clone()
+}
+
+#[cfg(windows)]
+impl Shader {
+    /// This pixel shader's code with its color exports brought into the range of the float
+    /// targets of `ranges` ([`victory_shader::emit::translate_for_targets`]), as the console's
+    /// color block converts to them; `None` where the plain translation does (no such target,
+    /// `VICTORY_F16_RTZ` not 1, or no translation of this form).
+    pub(crate) fn code_for_targets(&self, ranges: u32) -> Option<Arc<Vec<u8>>> {
+        if ranges == 0 || !victory_shader::emit::export_range_on() {
+            return None;
+        }
+        let mut made = self.for_targets.lock().unwrap_or_else(|e| e.into_inner());
+        made.entry(ranges)
+            .or_insert_with(|| {
+                match crate::shader_cache::host_shader_for_targets(&self.container, ranges) {
+                    Ok(host) => Some(Arc::new(host.dxil)),
+                    Err(e) => {
+                        tracing::warn!(hash = %self.hash, error = %e, "no pixel shader for its float targets; the plain one is used");
+                        None
+                    }
+                }
+            })
+            .clone()
+    }
 }
 
 /// A translated shader and the console resources its code reads.
@@ -148,6 +226,8 @@ impl Shader {
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
+                // Timed only for the debug server (VICTORY_MCP).
+                let began = victory_mcp::enabled().then(std::time::Instant::now);
                 let done = translate(&self.container);
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
@@ -163,6 +243,16 @@ impl Shader {
                 if let Ok(t) = &done {
                     KEPT[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     KEPT[3].fetch_add(t.host.dxil.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                }
+                if let Some(began) = began {
+                    victory_mcp::pipeline_event(
+                        victory_mcp::KIND_SHADER_TRANSLATED,
+                        &self.hash,
+                        Some(self.stage),
+                        done.as_ref().err().map(String::as_str),
+                        crate::frame::current(),
+                        Some(began.elapsed().as_secs_f64() * 1000.0),
+                    );
                 }
                 match &done {
                     Ok(t) => tracing::info!(
@@ -201,6 +291,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     use victory_shader::{Container, FourCC, HwStage};
     // The translation depends on it (a view index past a capped heap).
     crate::descriptor::host::probe_view_limit();
+    victory_shader::structure::set_split_copies(victory_core::tunables::known::VOXEL_VIS_COPIES.get());
     let c = Container::parse(container).map_err(|e| e.to_string())?;
     let programs = match c.part(FourCC::DXIL).or(c.part(FourCC::ACCC)) {
         Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
@@ -223,7 +314,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         })
         .map(|p| p.used)
         .unwrap_or_default();
-    let tables = crate::draw::TablePlan::new(&used, &host.root_indexed_views);
+    let tables = crate::draw::TablePlan::new(&used, &host.root_indexed_views, &host.half_views);
     Ok(Translated {
         host,
         threads,
@@ -303,8 +394,7 @@ fn of_builder(shaders: &[Arc<Shader>]) -> bool {
 /// memory when the title writes them.
 #[cfg(windows)]
 pub(crate) fn builder_quarantined(this: This) -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    is_builder(this) && *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_QUARANTINE").is_some_and(|v| v == "1"))
+    is_builder(this) && victory_core::tunables::known::BVH_QUARANTINE.get()
 }
 
 /// Whether the title's pipeline `this` is one of the structure builder's.
@@ -329,8 +419,7 @@ pub(crate) fn builder_rests(why: &'static str) {
 /// [`Builder`]).
 #[cfg(windows)]
 pub(crate) fn builder_runs() -> bool {
-    static ALLOWED: OnceLock<bool> = OnceLock::new();
-    if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
+    if !victory_core::tunables::known::BVH_BUILDER.get() {
         return false;
     }
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
@@ -445,6 +534,16 @@ pub(crate) fn bound(this: This) {
     let frame = crate::frame::current();
     for shader in &p.shaders {
         tracing::info!(pipeline = ?this, frame, stage = shader.stage, size = shader.container.len(), hash = %shader.hash, "first bind");
+        if victory_mcp::enabled() {
+            victory_mcp::pipeline_event(
+                victory_mcp::KIND_FIRST_BIND,
+                &shader.hash,
+                Some(shader.stage),
+                None,
+                frame,
+                None,
+            );
+        }
     }
 }
 
@@ -454,6 +553,9 @@ pub(crate) fn bound(this: This) {
 #[cfg(windows)]
 pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     if this.is_null() {
+        return None;
+    }
+    if victory_core::tunables::known::SKIP_HAIR.get() && pipeline(this).shaders.iter().any(|s| s.hair) {
         return None;
     }
     make::ready(&pipeline(this).host)
@@ -510,6 +612,27 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
 #[cfg(all(windows, feature = "diagnostics"))]
 pub(crate) fn is_skipped(this: This) -> bool {
     !this.is_null() && skipped_shader(pipeline(this)).is_some()
+}
+
+/// For the dropped-draw report: the stages and shader hashes of `this`
+/// (`vertex:ab+pixel:cd`; a compute one is `compute:ab`).
+pub(crate) fn drop_key(this: usize) -> String {
+    let this = this as This;
+    if this.is_null() {
+        return "no pipeline".to_owned();
+    }
+    let shaders: Vec<String> = pipeline(this).shaders.iter().map(|s| format!("{}:{}", s.stage, s.hash)).collect();
+    shaders.join("+")
+}
+
+/// For the dropped-draw report: why `this` has no host pipeline.
+#[cfg(windows)]
+pub(crate) fn why_no_host(this: usize) -> crate::droprep::Reason {
+    let this = this as This;
+    if this.is_null() {
+        return crate::droprep::Reason::NoPipelineSet;
+    }
+    make::lack(&pipeline(this).host).unwrap_or(crate::droprep::Reason::Unknown)
 }
 
 /// Counts a draw or dispatch of `this` intentionally skipped or dropped

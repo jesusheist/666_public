@@ -23,8 +23,7 @@ use super::*;
 use crate::shadow::Shadow;
 
 pub(super) fn own() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_SEND_OWN").is_none_or(|v| v != "0"))
+    victory_core::tunables::known::SEND_OWN.get()
 }
 
 /// Runs up to this many bytes go as pairs.
@@ -56,8 +55,7 @@ pub(crate) fn goes_as_words(at: usize, len: usize) -> bool {
 /// byte, that byte is as it was before the flight. The landing rests on the
 /// same ([`crate::shadow::exact_back`]).
 pub(crate) fn words_under() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| own() && std::env::var_os("VICTORY_UNDER_WORDS").is_none_or(|v| v != "0"))
+    own() && victory_core::tunables::known::UNDER_WORDS.get()
 }
 
 const SCATTER: &str = r#"
@@ -131,8 +129,7 @@ fn kept() -> u64 {
 /// card-1), so it is a loss while the card waits for that thread: off by
 /// default.
 fn on_card() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_SEND_BAR").is_some_and(|v| v == "1"))
+    victory_core::tunables::known::SEND_BAR.get()
 }
 
 fn memory(host: &Host, size: u64) -> Option<Memory> {

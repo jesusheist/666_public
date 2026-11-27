@@ -54,6 +54,9 @@ fn build() -> [u8; 32] {
                 "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"
             );
         }
+        if let Some(note) = victory_shader::emit::wide_filter_note() {
+            tracing::warn!("{note}");
+        }
         let mut bytes = env!("VICTORY_TRANSLATOR").as_bytes().to_vec();
         bytes.extend_from_slice(&limit.to_le_bytes());
         // Which group barriers wait is part of the translation too.
@@ -64,17 +67,26 @@ fn build() -> [u8; 32] {
         // executable had cached with the switch unset.
         for name in [
             "VICTORY_WAVE_WIDE",
+            "VICTORY_WAVE_WIDE_SKIP",
+            "VICTORY_WAVE_WIDE_ONLY",
+            "VICTORY_KEEP_EXECZ_LOOPS",
+            "VICTORY_WIDE_EMPTY_FIX",
             "VICTORY_WAVE_DEEP_SKIPS",
             "VICTORY_WAVE_OWN_BITS",
             "VICTORY_WAVE_LOCAL",
             "VICTORY_F16_NEAREST",
+            "VICTORY_F16_RTZ",
             "VICTORY_HELPER_OWN",
             "VICTORY_FIRSTLANE_OWN",
             "VICTORY_FIRST_HALF",
             "VICTORY_STRICT_JOINS",
             "VICTORY_MESH_OUTPUT_STRICT",
+            "VICTORY_MESH_FIT",
+            "VICTORY_FUSED_MAD",
+            "VICTORY_FUSED_MAD_ONLY",
             "VICTORY_BVH_FENCES",
             "VICTORY_BVH_BOUNDS",
+            "VICTORY_LEGACY_MUL",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
@@ -83,6 +95,19 @@ fn build() -> [u8; 32] {
             }
             bytes.push(0);
         }
+        // The paired wave64 form (`VICTORY_WAVE_PAIRS`, its program list and its FP32 mode
+        // confirmation): only the ones that are set, so the key of translations made
+        // without it is unchanged.
+        for name in ["VICTORY_WAVE_PAIRS", "VICTORY_WAVE_PAIRS_ONLY", "VICTORY_WAVE_PAIRS_FP32"] {
+            if let Some(value) = std::env::var_os(name) {
+                bytes.extend_from_slice(name.as_bytes());
+                bytes.push(b'=');
+                bytes.extend_from_slice(value.as_encoded_bytes());
+                bytes.push(0);
+            }
+        }
+        // And whether the voxel visibility recovery of split scalar copies is on.
+        bytes.push(u8::from(victory_core::tunables::known::VOXEL_VIS_COPIES.get()));
         // And which clean-up passes ran over the translated code.
         bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
         bytes
@@ -92,7 +117,52 @@ fn build() -> [u8; 32] {
     for value in victory_shader::emit::host_settings() {
         hash.update(&value.to_le_bytes());
     }
+    // Renderer port 5 (`VICTORY_PORT_CBV=1`): constant buffers read as raw bytes. Only when
+    // on, so the translations cached without it keep their key.
+    if victory_shader::emit::constants_raw() {
+        hash.update(b"VICTORY_PORT_CBV=1");
+    }
     *hash.finalize().as_bytes()
+}
+
+/// What tells one set of translations from another ([`build`]), and for a pixel shader that
+/// draws into float targets narrower than 32 bits which of them it is made for (`ranges`,
+/// [`victory_shader::emit::translate_for_targets`]).
+fn build_for(ranges: u32) -> [u8; 32] {
+    let build = build();
+    if ranges == 0 {
+        return build;
+    }
+    let mut hash = blake3::Hasher::new();
+    hash.update(&build);
+    hash.update(b"color targets");
+    hash.update(&ranges.to_le_bytes());
+    *hash.finalize().as_bytes()
+}
+
+/// The console hash of a shader container (the first 16 hex digits of its BLAKE3), which
+/// `VICTORY_FUSED_MAD_ONLY` names shaders by.
+fn container_hash(container: &[u8]) -> String {
+    blake3::hash(container).to_hex()[..16].to_owned()
+}
+
+/// Runs a translation of `container` with its fused multiply-add decision set.
+fn with_fused<R>(container: &[u8], f: impl FnOnce() -> R) -> R {
+    victory_shader::emit::with_fused_mad_hash(&container_hash(container), f)
+}
+
+/// `key` with this shader's own fused multiply-add decision (`VICTORY_FUSED_MAD`,
+/// `VICTORY_FUSED_MAD_ONLY`), so a change of either re-translates exactly the shaders it changes.
+fn fused_key(key: &[u8; 32], container: &[u8]) -> [u8; 32] {
+    let mut hash = blake3::Hasher::new();
+    hash.update(key);
+    hash.update(b"fused mad");
+    hash.update(&[u8::from(victory_shader::emit::fused_mad_for(&container_hash(container)))]);
+    *hash.finalize().as_bytes()
+}
+
+fn build_fused(container: &[u8]) -> [u8; 32] {
+    fused_key(&build(), container)
 }
 
 /// What tells one set of translations from another ([`build`]).
@@ -115,9 +185,28 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    let translate = |c: &[u8]| {
+        with_fused(c, || victory_shader::emit::translate(c)).map_err(|e| e.to_string())
+    };
     match CACHE.get() {
-        Some(cache) => cached(cache, &build(), container, translate),
+        Some(cache) => cached(cache, &build_fused(container), container, translate),
+        None => translate(container),
+    }
+}
+
+/// [`host_shader`] for a pixel shader that draws into targets whose formats `ranges` names
+/// (per target 4 bits: [`victory_shader::emit::RANGE_HALF`], [`victory_shader::emit::RANGE_11_11_10`]):
+/// its color exports are brought into what those formats hold, as the console's color block
+/// does. Only the code differs from [`host_shader`]'s; the bindings are the same.
+pub(crate) fn host_shader_for_targets(container: &[u8], ranges: u32) -> Result<HostShader, String> {
+    let translate = move |c: &[u8]| {
+        with_fused(c, || victory_shader::emit::translate_for_targets(c, ranges)).map_err(|e| e.to_string())
+    };
+    match CACHE.get() {
+        Some(cache) => {
+            let key = build_for(ranges);
+            cached(cache, &fused_key(&key, container), container, translate)
+        }
         None => translate(container),
     }
 }
@@ -267,6 +356,11 @@ fn encode(s: &HostShader) -> Vec<u8> {
             word(&mut out, value);
         }
     }
+    word(&mut out, s.half_views.len() as u32);
+    for &(slot, dword) in &s.half_views {
+        word(&mut out, u32::from(slot));
+        word(&mut out, dword);
+    }
     out
 }
 
@@ -335,6 +429,11 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
             shift: u8::try_from(r.word()?).ok().filter(|&s| s < 32)?,
         });
     }
+    let n = r.word()? as usize;
+    let mut half_views = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        half_views.push((u8::try_from(r.word()?).ok()?, r.word()?));
+    }
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -345,6 +444,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_srvs,
         root_uavs,
         root_indexed_views,
+        half_views,
     })
 }
 
@@ -379,6 +479,7 @@ mod tests {
                 byte_offset: 32,
                 shift: 5,
             }],
+            half_views: vec![(0, 8), (4, 0)],
         }
     }
 

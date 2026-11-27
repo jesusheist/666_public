@@ -162,8 +162,7 @@ struct Card {
 /// shaders, as before, and goes back to the title the next time a declared
 /// range holds its piece (before: never).
 pub(crate) fn cards() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_BUFFERS").is_none_or(|v| v != "0"))
+    victory_core::tunables::known::CARD_BUFFERS.get()
 }
 
 /// Default `(min_mb, max_mb)` for [`card_limits`] chosen from the adapter's
@@ -217,21 +216,21 @@ fn resolve_card_limits(
 fn card_limits() -> (u64, u64) {
     static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
     *LIMITS.get_or_init(|| {
-        let env_mb = |name: &str| std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok());
+        // -1: not set (derived from the budget).
+        let mb = |t: &'static victory_core::tunables::Tunable<i64>| u64::try_from(t.get()).ok();
         let vram_budget = crate::host::host().and_then(|h| h.video_memory()).map(|[budget, ..]| budget);
         let (mut min_bytes, max_bytes) = resolve_card_limits(
             vram_budget,
-            env_mb("VICTORY_CARD_BUFFERS_MIN_MB"),
-            env_mb("VICTORY_CARD_BUFFERS_MB"),
+            mb(&victory_core::tunables::known::CARD_BUFFERS_MIN_MB),
+            mb(&victory_core::tunables::known::CARD_BUFFERS_MB),
         );
         // `VICTORY_CARD_BUFFERS_MIN_KB` (after fxceless c36971b2) says the
         // least size in KiB, so that it can go under 1 MiB: 64 is every title
         // buffer. Copies under 1 MiB are nearly all there are and few bytes;
         // in the PC's memory every load, store and atomic a shader does on
         // them crosses the bus.
-        if let Some(kib) = std::env::var("VICTORY_CARD_BUFFERS_MIN_KB").ok().and_then(|v| v.trim().parse::<u64>().ok())
-            && kib > 0
-        {
+        let kib = victory_core::tunables::known::CARD_BUFFERS_MIN_KB.get() as u64;
+        if kib > 0 {
             min_bytes = kib << 10;
         }
         if card_all() {
@@ -280,8 +279,7 @@ static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// a copy is made up to 97 hundredths of the budget (its room was kept),
 /// and the room of a copy turned down is given up ([`CARD_REFUSED`]).
 fn card_room_kept_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_ROOM_FOR_BUFFERS").is_none_or(|v| v != "0"))
+    victory_core::tunables::known::CARD_ROOM_FOR_BUFFERS.get()
 }
 
 /// Title buffers big enough for a copy in the card's memory that were
@@ -318,6 +316,16 @@ pub(crate) fn live_span_bytes() -> u64 {
     CARD_BYTES[0].load(Ordering::Relaxed)
         + WINDOW_CARD_BYTES.load(Ordering::Relaxed)
         + WINDOW_MAPPED_BYTES.load(Ordering::Relaxed)
+}
+
+/// Bytes of the card copies of title buffers alive (the memory snapshot).
+pub(crate) fn card_buffer_bytes() -> u64 {
+    CARD_BYTES[0].load(Ordering::Relaxed)
+}
+
+/// Bytes of the card copies of windows of title memory alive.
+pub(crate) fn window_card_bytes() -> u64 {
+    WINDOW_CARD_BYTES.load(Ordering::Relaxed)
 }
 
 /// [`CARD_STATS`], taken; then the copies in the card's memory, their
@@ -371,8 +379,7 @@ fn card_for(size: u64) -> Option<ID3D12Resource> {
 /// (`crate::host::send` has the order of those right for copies with two
 /// sides), and so are the bytes put in beside shaders' writes.
 fn card_all() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_ALL").is_some_and(|v| v == "1"))
+    victory_core::tunables::known::CARD_ALL.get()
 }
 
 /// [`card_for`] in the card's own memory.
@@ -452,10 +459,7 @@ fn card_room_for(size: u64) -> Option<ID3D12Resource> {
 /// memory, so the memory shared with the card does not shrink by this
 /// alone; what moves is what shaders read.
 fn window_card_most() -> u64 {
-    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *MOST.get_or_init(|| {
-        std::env::var("VICTORY_CARD_WINDOWS_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) << 20
-    })
+    (victory_core::tunables::known::CARD_WINDOWS_MB.get() as u64) << 20
 }
 
 /// Bytes alive of windows' card sides ([`window_card_most`]).
@@ -490,10 +494,7 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
 /// Windows go there while a fifth of the card's budget is free, as with
 /// [`window_room_for`], which this comes before.
 fn window_mapped_most() -> u64 {
-    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *MOST.get_or_init(|| {
-        std::env::var("VICTORY_WINDOWS_BAR_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) << 20
-    })
+    (victory_core::tunables::known::WINDOWS_BAR_MB.get() as u64) << 20
 }
 
 /// Bytes alive of windows in card memory the CPU maps.
@@ -529,8 +530,7 @@ fn window_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
 /// replay2, and what changes in them under submissions in the air is what the
 /// title's CPU writes, which it does not while they read it).
 fn windows_own() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WINDOWS_OWN").is_some_and(|v| v == "1"))
+    victory_core::tunables::known::WINDOWS_OWN.get()
 }
 
 /// [`window_card_for`] in the card's own memory.
@@ -1475,8 +1475,7 @@ struct Workers {
 /// most (0, the default: not at all): asleep, a thread is woken in 50 us and
 /// more, 95 times a frame.
 fn spin(there: impl Fn() -> bool) {
-    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let most = *MOST.get_or_init(|| std::env::var("VICTORY_WIDE_SPIN").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0));
+    let most = victory_core::tunables::known::WIDE_SPIN.get() as u64;
     if most == 0 {
         return;
     }
@@ -1489,8 +1488,36 @@ fn spin(there: impl Fn() -> bool) {
 }
 
 /// How many threads are kept for [`wide`].
+///
+/// `VICTORY_WIDE_THREADS=N` (1 to 24; unset: off): N threads instead of a
+/// quarter of the logical processors, 2 to 6. On a 32-thread processor that is
+/// 6 helpers, while most of the machine stands idle in the busy frames
+/// (25% of the CPU with the preparing at 80 ms).
 fn wide_threads() -> usize {
-    std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6)
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        wide_threads_for(
+            Some(victory_core::tunables::known::WIDE_THREADS.get().to_string()).as_deref(),
+            std::thread::available_parallelism().map_or(4, |n| n.get()),
+        )
+    })
+}
+
+fn wide_threads_for(setting: Option<&str>, logical_cpus: usize) -> usize {
+    match setting.and_then(|v| v.trim().parse::<usize>().ok()) {
+        Some(n) if n > 0 => n.min(24),
+        _ => (logical_cpus / 4).clamp(2, 6),
+    }
+}
+
+/// Whether the threads kept for [`wide`] are left where the system puts them,
+/// the slow cores too (`VICTORY_WIDE_ANY_CORE=1`; off: they are asked to stay
+/// on the fast cores, as `VICTORY_FAST_CORES` says). With more helpers than
+/// the fast cores can run beside the submitting thread and the title's, the
+/// slow cores stand idle.
+fn wide_any_core() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("VICTORY_WIDE_ANY_CORE"))
 }
 
 fn workers() -> &'static Workers {
@@ -1504,7 +1531,9 @@ fn workers() -> &'static Workers {
     STARTED.call_once(|| {
         for i in 0..wide_threads() {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
-                crate::cores::keep_helper_on_fast_cores("victory-wide");
+                if !wide_any_core() {
+                    crate::cores::keep_helper_on_fast_cores("victory-wide");
+                }
                 let workers = WORKERS.get().expect("made above");
                 loop {
                     let job = {
@@ -4976,6 +5005,12 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // memory. Not the big ones `cards` puts in the card's memory: those
         // are read too often to stay in the PC's.
         let big = cards() && (size >= card_limits().0 || card_all());
+        // Renderer port 1 (`crate::port`, `VICTORY_PORT_CONSTANTS=1`): the
+        // title's 32-bit graphics heap in place, big or not.
+        if let Some(placed) = crate::port::place_for(key.0, len, false) {
+            entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
+            return entry.shadow.clone();
+        }
         if !big && let Some(placed) = crate::inplace::place_for(key.0, len, false) {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
@@ -5283,7 +5318,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     }
     // In place, if asked for and the window's memory can be opened: the
     // window is the title's own memory, with nothing to copy.
-    if let Some(placed) = crate::inplace::place_for(start, len, true) {
+    if let Some(placed) = crate::port::place_for(start, len, true).or_else(|| crate::inplace::place_for(start, len, true)) {
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
         note(&shadow);
         map.insert((start, len), shadow.clone());
@@ -5591,4 +5626,19 @@ pub(crate) fn near(va: u64) -> String {
         ));
     }
     text
+}
+
+#[cfg(test)]
+mod wide_threads_tests {
+    use super::wide_threads_for;
+
+    #[test]
+    fn the_thread_count_is_a_quarter_of_the_processors_unless_told() {
+        assert_eq!(wide_threads_for(None, 32), 6);
+        assert_eq!(wide_threads_for(None, 4), 2);
+        assert_eq!(wide_threads_for(Some("0"), 32), 6);
+        assert_eq!(wide_threads_for(Some("x"), 16), 4);
+        assert_eq!(wide_threads_for(Some("12"), 32), 12);
+        assert_eq!(wide_threads_for(Some("99"), 32), 24);
+    }
 }

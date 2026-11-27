@@ -43,7 +43,8 @@ static SPARES: AtomicUsize = AtomicUsize::new(SPARE);
 /// Asked once a second.
 pub(crate) fn room(memory: Option<[u64; 4]>) {
     let pressure = crate::residency::pressured();
-    let limit = spares(memory, crate::host::keep_freed() && !pressure);
+    // (After eviction let go of copies the empty blocks go too: the room is what it wanted.)
+    let limit = if crate::vram::trimming() { SPARE } else { spares(memory, crate::host::keep_freed() && !pressure) };
     SPARES.store(limit, Ordering::Relaxed);
     let tick = now();
     // A full pool can become idle while another subsystem needs the VRAM.
@@ -80,8 +81,7 @@ fn now() -> u64 {
 }
 
 pub(crate) fn on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_POOL").is_none_or(|v| v != "0"))
+    victory_core::tunables::known::TEXTURE_POOL.get()
 }
 
 /// How many blocks of textures are made ahead, so that one has been there
@@ -97,8 +97,7 @@ pub(crate) fn on() -> bool {
 /// every submission begun before its making has left behind ([`Ripe`]) has
 /// no such lists: pieces are cut from those first.
 fn ahead() -> usize {
-    static AHEAD: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *AHEAD.get_or_init(|| std::env::var("VICTORY_RIPE_BLOCKS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(12))
+    victory_core::tunables::known::RIPE_BLOCKS.get() as usize
 }
 
 /// Submissions begun and finished ([`crate::host::submissions`]), and how

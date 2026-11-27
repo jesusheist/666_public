@@ -74,7 +74,7 @@ pub(crate) fn on() -> bool {
     }
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var_os("VICTORY_BOOK").is_none_or(|v| v != "0")
+        victory_core::tunables::known::BOOK.get()
             && !cfg!(test)
             && (crate::host::dred_any() || checks())
     })
@@ -82,8 +82,7 @@ pub(crate) fn on() -> bool {
 
 /// `VICTORY_SLOT_CHECK=1`.
 pub(crate) fn checks() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_SLOT_CHECK").is_some_and(|v| v != "0"))
+    victory_core::tunables::known::SLOT_CHECK.get()
 }
 
 fn with<T>(f: impl FnOnce(&mut Book) -> T) -> T {

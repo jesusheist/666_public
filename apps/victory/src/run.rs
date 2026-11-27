@@ -35,6 +35,37 @@ fn check_cpu_features() -> Result<()> {
     check_cpu_features_with(has_avx2, skip.as_deref())
 }
 
+/// `VICTORY_PROMPTS=keys`: places the hook that hands the title key caps for
+/// its button pictures (imjustprism, Marvisak/VIctory#3433), named from the
+/// `[controls]` layout in force, and says whether it is placed. Before the
+/// title starts. Off by default, and with `[controls]` off (a pad is used)
+/// the title's own pictures stay.
+#[cfg(windows)]
+fn show_keys_in_prompts(
+    image: &victory_loader::LoadedImage,
+    build: Option<&victory_game::KnownBuild>,
+) {
+    if !victory_hle::modules::controls::enabled() {
+        println!("prompts        gamepad pictures: [controls] is off");
+        return;
+    }
+    let Some(build) = build else {
+        println!("prompts        gamepad pictures: the keys need a known build");
+        return;
+    };
+    let Some(offsets) = build.key_prompts else {
+        println!("prompts        gamepad pictures: no keys for {}", build.label);
+        return;
+    };
+    victory_game::prompts::pad::set_key_source(victory_hle::modules::controls::prompt_key);
+    // SAFETY: the image of the build the offsets belong to is mapped and
+    // bound, and no title thread runs yet.
+    match unsafe { victory_game::prompts::hook::install(image, offsets) } {
+        Ok(()) => println!("prompts        keyboard keys: hook placed"),
+        Err(refused) => println!("prompts        gamepad pictures: {refused}"),
+    }
+}
+
 #[cfg(windows)]
 pub fn run(
     exe: &Path,
@@ -52,7 +83,37 @@ pub fn run(
     }
     // A title that relaunched itself: the old process must be gone first.
     victory_hle::modules::lifecycle::wait_for_previous();
-    let cfg = victory_core::Config::load()?;
+    let mut cfg = victory_core::Config::load()?;
+    let controls = cfg.controls.take().map(|settings| {
+        let bindings =
+            |table: std::collections::BTreeMap<_, victory_core::config::ControlBinding>| {
+                table
+                    .into_iter()
+                    .map(|(key, value)| (key, value.into_outputs()))
+                    .collect()
+            };
+        victory_hle::modules::controls::Options {
+            enabled: settings.enabled,
+            mouse_sensitivity: settings.mouse_sensitivity,
+            mouse_y_scale: settings.mouse_y_scale,
+            mouse_invert_y: settings.mouse_invert_y,
+            mouse_capture: settings.mouse_capture,
+            mouse_carry: settings.mouse_carry,
+            stick_deadzone: settings.stick_deadzone,
+            stick_curve: settings.stick_curve,
+            walk_speed: settings.walk_speed,
+            keys_by_position: settings.keys_by_position,
+            start_in_vehicle: settings.start_in_vehicle,
+            aircraft_vehicle: matches!(
+                settings.vehicle_layout,
+                Some(victory_core::config::VehicleLayout::Aircraft)
+            ),
+            on_foot: bindings(settings.on_foot),
+            vehicle: bindings(settings.vehicle),
+            aircraft: bindings(settings.aircraft),
+        }
+    });
+    victory_hle::modules::controls::configure(controls.as_ref()).map_err(anyhow::Error::msg)?;
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
@@ -163,6 +224,15 @@ pub fn run(
     }
     let exe_name = exe.file_name().unwrap_or_default().to_string_lossy();
     show(&exe_name, image.bind_imports(&with_dlls, policy)?);
+    // VICTORY_PROMPTS=keys: the title's button prompts show the keys of the
+    // [controls] layout in force instead of gamepad pictures.
+    if victory_core::tunables::known::PROMPTS.get_str() == "keys" {
+        if execute {
+            show_keys_in_prompts(&image, victory_game::identify(&hash));
+        } else {
+            println!("prompts        keyboard keys: the hook is placed only with --execute");
+        }
+    }
     if execute {
         let size = image.info().size_of_image as usize;
         // SAFETY: the image stays mapped, and nothing of it has run yet.

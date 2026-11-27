@@ -78,7 +78,7 @@ pub(crate) static STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
 pub(crate) fn wanted() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        if !std::env::var_os("VICTORY_LEVELS_ON_DEMAND").is_some_and(|v| v == "1") {
+        if !victory_core::tunables::known::LEVELS_ON_DEMAND.get() {
             return false;
         }
         let Some(host) = host() else {
@@ -105,10 +105,8 @@ pub(crate) fn wanted() -> bool {
     })
 }
 
-fn parse_floor(value: Option<&str>) -> u64 {
-    value
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .map_or(1 << 20, |kb| kb.max(64).saturating_mul(1024))
+fn floor_bytes(kb: i64) -> u64 {
+    (kb.max(64) as u64).saturating_mul(1024)
 }
 
 /// The bytes from which a texture is made this way: a megabyte, or
@@ -116,8 +114,7 @@ fn parse_floor(value: Option<&str>) -> u64 {
 /// held are 1.9 MB a copy on some 1,600 copies; a 512x512 texture has six
 /// tiles at most, and most of the calls for nothing.)
 pub(crate) fn floor() -> u64 {
-    static BYTES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *BYTES.get_or_init(|| parse_floor(std::env::var("VICTORY_LEVELS_MIN_KB").ok().as_deref()))
+    floor_bytes(victory_core::tunables::known::LEVELS_MIN_KB.get())
 }
 
 /// The bytes of the tiles given to textures now: the card's memory they
@@ -1473,11 +1470,9 @@ void look() {
 
     #[test]
     fn floor_saturates_instead_of_wrapping() {
-        assert_eq!(parse_floor(None), 1 << 20);
-        assert_eq!(parse_floor(Some("0")), 64 << 10);
-        assert_eq!(parse_floor(Some("2048")), 2048 << 10);
-        assert_eq!(parse_floor(Some(&(1u64 << 54).to_string())), u64::MAX);
-        assert_eq!(parse_floor(Some(&u64::MAX.to_string())), u64::MAX);
+        assert_eq!(floor_bytes(1024), 1 << 20);
+        assert_eq!(floor_bytes(0), 64 << 10);
+        assert_eq!(floor_bytes(2048), 2048 << 10);
     }
 
     #[test]

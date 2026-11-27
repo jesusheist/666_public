@@ -200,6 +200,11 @@ pub(crate) struct Detached {
 
 #[cfg(windows)]
 impl Detached {
+    /// A closed list of ours, to run among a title's (`crate::heap_worker`).
+    pub(crate) fn ours(host: crate::host::HostList) -> Self {
+        Detached { host, _uploads: Vec::new(), _state: Default::default() }
+    }
+
     pub(crate) fn host(&self) -> &crate::host::HostList {
         &self.host
     }
@@ -244,14 +249,13 @@ const IDLE_MOST: (usize, u64) = (512, 256 << 20);
 /// `VICTORY_LIST_POOL=0`: each is made new and thrown away, as before).
 #[cfg(windows)]
 fn pools() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_POOL").is_none_or(|v| v != "0"))
+    victory_core::tunables::known::LIST_POOL.get()
 }
 
 /// A host list open for recording: one that has run, as a title's list is
 /// after its reset, or a new one.
 #[cfg(windows)]
-fn fresh_list() -> Option<crate::host::HostList> {
+pub(crate) fn fresh_list() -> Option<crate::host::HostList> {
     let idle = {
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
         let taken = idle.0.pop();
@@ -1112,12 +1116,7 @@ extern "system" fn copy_texture_region(
         // bake writes 256x256 at most, was drawn over a character's face
         // with other textures' bytes wherever nothing was baked, runs n01 and
         // textures-1.)
-        static OVER: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-        let over = *OVER.get_or_init(|| match std::env::var("VICTORY_COPY_OVER_TITLE").as_deref() {
-            Ok("0") => 0,
-            Ok("title") => 1,
-            _ => 2,
-        });
+        let over = victory_core::tunables::known::COPY_OVER_TITLE.get();
         if over != 0 && crate::texture::title_written(to) && !crate::texture::host_wrote(dst.resource as usize) {
             // One a list uploaded, or a draw sampled, holds the title's.
             if over == 2 && !list.used(dst.resource as usize) && !crate::texture::is_staged(dst.resource) {
@@ -1205,8 +1204,7 @@ fn read_back(
     use windows::Win32::Graphics::Direct3D12::D3D12_BOX;
     use windows::core::Interface;
     const FOOTPRINT: u32 = 1;
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("VICTORY_READ_BACK").is_none_or(|v| v != "0")) {
+    if !victory_core::tunables::known::READ_BACK.get() {
         return Err("switched off");
     }
     if dst.kind != FOOTPRINT || src.kind == FOOTPRINT {
@@ -2003,8 +2001,7 @@ impl ValueWait {
         if self.address == 0 {
             return true;
         }
-        static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *ASK.get_or_init(|| std::env::var_os("VICTORY_WAIT_ASK").is_some_and(|v| v == "1"))
+        if victory_core::tunables::known::WAIT_ASK.get()
             && !crate::texture::committed(self.address as *const u8, bytes)
         {
             return true;
@@ -2206,8 +2203,7 @@ fn value_written(this: This, address: u64, value: u64) {
                 format!("WRITE VALUE at {address:#x} value {value:#x}")
             });
         }
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ON.get_or_init(|| std::env::var_os("VICTORY_CUT_WRITES").is_some_and(|v| v == "1"))
+        if !victory_core::tunables::known::CUT_WRITES.get()
             || !crate::queue::cuts()
         {
             return;

@@ -311,7 +311,7 @@ fn save(p: &mut Picture) {
 }
 
 fn watch(from: &mpsc::Receiver<Job>) {
-    let all = std::env::var_os("VICTORY_POP_ALL").is_some_and(|v| v == "1");
+    let all = victory_core::tunables::known::POP_ALL.get();
     let mut last: VecDeque<Picture> = VecDeque::new();
     let mut seen: [Seen; 4] = Default::default();
     let mut told = crate::host::now_ms();

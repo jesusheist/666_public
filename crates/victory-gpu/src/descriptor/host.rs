@@ -119,9 +119,8 @@ pub(crate) struct HostHeap {
     step: u32,
     /// Slots mirroring the title's; view heaps have `dynamic` more.
     count: u32,
-    /// Dynamic slots past `count`: [`DYNAMIC`] in view heaps, none in
-    /// sampler heaps. (Upstream falls back to 2^16 on a capped host heap;
-    /// ours keeps 2^18 there: 2^16 and 2^17 both ran out in this title.)
+    /// Per-draw slots past `count`, sized by [`dynamic_slots`] for view
+    /// heaps. Sampler heaps have none.
     dynamic: u32,
     sampler: bool,
     /// Where the raw twins of the title's slots start
@@ -288,8 +287,7 @@ struct Flip {
 /// were page faults in a texture made and shown in the last tenth of a
 /// second.
 pub(crate) fn show_after() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_SHOW_AFTER").is_some_and(|v| v != "0"))
+    victory_core::tunables::known::SHOW_AFTER.get()
 }
 
 /// Slots shown late ([`show_after`]), the frames they waited, the longest;
@@ -830,12 +828,11 @@ pub(crate) static STALE: [std::sync::atomic::AtomicU64; 5] =
 /// `VICTORY_STALE_TEXTURES=overlap`: wherever their spans overlap, the rule
 /// until run 188.
 fn stale_rule() -> Rule {
-    static RULE: std::sync::OnceLock<Rule> = std::sync::OnceLock::new();
-    *RULE.get_or_init(|| match std::env::var("VICTORY_STALE_TEXTURES").as_deref() {
-        Ok("0") => Rule::Never,
-        Ok("overlap") => Rule::Overlap,
+    match victory_core::tunables::known::STALE_TEXTURES.get() {
+        2 => Rule::Never,
+        1 => Rule::Overlap,
         _ => Rule::Start,
-    })
+    }
 }
 
 /// The runtime mapped or unmapped title memory `[at, at + len)`, or is
@@ -941,6 +938,11 @@ struct Waiting {
     /// the fingerprint it had at the upload, how many looks found it
     /// unchanged, and the frame of the upload. A fingerprint of 0: none.
     checked: (u64, u64, u64, u8, u64),
+}
+
+thread_local! {
+    /// This thread is inside [`HostHeap::publish`].
+    static PUBLISHING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// The queue of title slots whose texture view waits to be brought up to
@@ -1134,6 +1136,72 @@ pub(crate) fn is_texture_view(view: &View) -> bool {
     }
 }
 
+/// The unsigned integer format with the layout of a 16-bit float or
+/// signed format (one, two or four channels), if `format` is one.
+pub(crate) fn half_format(format: u32) -> Option<u32> {
+    match format {
+        // R16G16B16A16_FLOAT and _SINT: R16G16B16A16_UINT.
+        10 | 14 => Some(12),
+        // R16G16_FLOAT and _SINT: R16G16_UINT.
+        34 | 38 => Some(36),
+        // R16_FLOAT and _SINT: R16_UINT.
+        54 | 59 => Some(57),
+        _ => None,
+    }
+}
+
+/// `view` as a shader is shown it where it moves a buffer's 16-bit
+/// channels as unsigned integers
+/// (`victory_shader::emit::HostShader::half_views`, `VICTORY_HALF_VIEWS=1`):
+/// a buffer view in a 16-bit float or signed format, in the unsigned format
+/// of the same layout, through which every 16-bit pattern is read and
+/// stored as it is. `None` for every other view: the title's own serves (an
+/// unsigned one already carries the bits; a texture can only be viewed in
+/// the formats it was made for).
+pub(crate) fn half_view(view: &View) -> Option<View> {
+    // Buffer views: dimension 1 in the title's description of either kind.
+    const BUFFER: u32 = 1;
+    match view {
+        View::Shader(resource, Some(desc)) if desc[1] == BUFFER => {
+            let mut desc = *desc;
+            desc[0] = half_format(desc[0])?;
+            Some(View::Shader(*resource, Some(desc)))
+        }
+        View::Unordered(resource, counter, Some(desc)) if desc[1] == BUFFER => {
+            let mut desc = *desc;
+            desc[0] = half_format(desc[0])?;
+            Some(View::Unordered(*resource, *counter, Some(desc)))
+        }
+        View::Placed(unordered, resource, desc) if resource[0] == BUFFER && desc[1] == BUFFER => {
+            let mut desc = *desc;
+            desc[0] = half_format(desc[0])?;
+            Some(View::Placed(*unordered, *resource, desc))
+        }
+        _ => None,
+    }
+}
+
+/// The format of `view`, a buffer view through which a shader moves 16-bit
+/// channels as unsigned integers, if those integers are not what the
+/// console gives: a format of wider channels, a normalised one or a signed
+/// 8-bit one, whose values the console converts to and from halves. `None`
+/// for the formats the integers serve exactly (16 bits a channel of any
+/// kind, through [`half_view`] where needed, and unsigned channels of fewer
+/// bits; the title's are 16-bit unsigned) and for any other view.
+pub(crate) fn half_inexact(view: &View) -> Option<u32> {
+    // Buffer views: dimension 1 in the title's description of either kind.
+    const BUFFER: u32 = 1;
+    // R16G16B16A16, R16G16 and R16 (float, unsigned, signed), then
+    // R10G10B10A2, R8G8B8A8, R8G8 and R8 unsigned.
+    const EXACT: [u32; 13] = [10, 12, 14, 34, 36, 38, 54, 57, 59, 25, 30, 50, 62];
+    let format = match view {
+        View::Shader(_, Some(desc)) | View::Unordered(_, _, Some(desc)) if desc[1] == BUFFER => desc[0],
+        View::Placed(_, resource, desc) if resource[0] == BUFFER && desc[1] == BUFFER => desc[0],
+        _ => return None,
+    };
+    (!EXACT.contains(&format)).then_some(format)
+}
+
 /// Buffer views left null because the host would refuse them
 /// ([`buffer_view_ok`]), since the start.
 pub(crate) static REFUSED_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1250,8 +1318,7 @@ fn twinned(view: &View) -> bool {
 /// Whether views off their copy's elements get a copy of their own bytes. On by
 /// default; `VICTORY_VIEW_BYTES=0` leaves them null, as before.
 fn view_bytes() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_BYTES").is_none_or(|v| v != "0"))
+    victory_core::tunables::known::VIEW_BYTES.get()
 }
 
 /// The copy the buffer view of `[start, start + len)` is made on: `shadow`, the one
@@ -1414,8 +1481,7 @@ const RAW_TWINS: u32 = 1 << 21;
 /// read the title's slots themselves, as before). Needs a host that takes
 /// heaps of 2^22 views.
 fn raw_twins() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_RAW_VIEWS").is_none_or(|v| v != "0"))
+    victory_core::tunables::known::RAW_VIEWS.get()
 }
 
 /// Picks, once, the null slot at the end of every host view heap and tells
@@ -1482,24 +1548,50 @@ pub(crate) fn probe_view_limit() {
 /// table past them is made afresh in these slots like any other.
 pub(crate) const DYNAMIC: u32 = 1 << 18;
 
-/// [`DYNAMIC`] for a heap of `count` title slots whose null slot is `null`
-/// (0: none): up to four times as many where the host heap has the room (a
-/// host that takes more than [`PORTABLE_VIEWS`]; `VICTORY_DYNAMIC_SLOTS`
-/// sets the most). 2^18 ran out in the title's bigger places (session
-/// play-1125-0127: 27,000 to 35,000 tables a frame, up to 3,285 of them
-/// refused, with 2,639 indirect draws and dispatches).
-fn dynamic_slots(count: u32, null: u32) -> u32 {
-    static MOST: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    let most = *MOST.get_or_init(|| {
-        std::env::var("VICTORY_DYNAMIC_SLOTS")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(DYNAMIC << 2)
-    });
+/// `VICTORY_DESC_EXPAND`: on unless set to 0 (or off/false).
+fn desc_expand() -> bool {
+    victory_core::tunables::known::DESC_EXPAND.get()
+}
+
+/// Dynamic slot counters for the memory log: tables refused for want of
+/// room, and tables taken past the first [`DYNAMIC`] slots (room the old
+/// split did not have on a capped host; 0 with `VICTORY_DESC_EXPAND=0`).
+pub(crate) static DYNAMIC_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static DYNAMIC_EXPANDED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn configured_dynamic_slots() -> Option<u32> {
+    u32::try_from(victory_core::tunables::known::DYNAMIC_SLOTS.get()).ok()
+}
+
+/// Dynamic slots for a heap with `count` title slots and a null descriptor at
+/// `null`. When the capped host cannot hold the whole title heap plus the
+/// dynamic reserve, use more of its slots for dynamic tables. The tested
+/// retail heap's upper range is a ring of per-draw tables that already get
+/// copied into dynamic slots. Keep 393,215 title slots by default for the
+/// long-lived views below that ring (fxceless/victory-fork#1258).
+///
+/// `VICTORY_DESC_EXPAND=0` turns the rebalance off: a capped host keeps
+/// [`DYNAMIC`] dynamic slots as before.
+///
+/// `VICTORY_DYNAMIC_SLOTS` can select the capped split, with at least
+/// [`DYNAMIC`] dynamic slots and 65,536 title slots. On an uncapped host it
+/// still limits the existing allocation of spare slots.
+fn dynamic_slots(count: u32, null: u32, configured: Option<u32>, expand: bool) -> u32 {
+    let spare = null.saturating_sub(count);
     if null < PORTABLE_VIEWS {
-        return DYNAMIC;
+        if !expand {
+            return DYNAMIC;
+        }
+        if spare >= DYNAMIC {
+            return DYNAMIC;
+        }
+        const TITLE_SLOTS: u32 = 393_215;
+        const MIN_TITLE_SLOTS: u32 = 1 << 16;
+        let default = null.saturating_sub(TITLE_SLOTS.min(count));
+        let maximum = null.saturating_sub(MIN_TITLE_SLOTS).max(DYNAMIC);
+        return configured.unwrap_or(default).clamp(DYNAMIC, maximum);
     }
-    null.saturating_sub(count).min(most).max(DYNAMIC)
+    spare.min(configured.unwrap_or(DYNAMIC << 2)).max(DYNAMIC)
 }
 
 impl HostHeap {
@@ -1534,7 +1626,11 @@ impl HostHeap {
             victory_shader::emit::view_heap_limit()
         };
         let raw = if sampler { 0 } else { victory_shader::emit::raw_views() };
-        let extra = if sampler { 0 } else { dynamic_slots(count, null) };
+        let extra = if sampler {
+            0
+        } else {
+            dynamic_slots(count, null, configured_dynamic_slots(), desc_expand())
+        };
         let (heap, count, size) = if null == 0 {
             match make(count + extra) {
                 Ok(heap) => (heap, count, count + extra),
@@ -1550,8 +1646,14 @@ impl HostHeap {
             } else {
                 // shortcut: descriptors past the host's limit are left out; a title that reaches
                 // them needs remapping. They read the null slot instead.
-                tracing::warn!(count, "host view heap capped at {size}; views past it read a null slot");
-                null - extra
+                let title_slots = null - extra;
+                tracing::warn!(
+                    count,
+                    title_slots,
+                    dynamic_slots = extra,
+                    "host view heap capped at {size}; views past it read a null slot"
+                );
+                title_slots
             };
             match make(size) {
                 Ok(heap) => (heap, fitted, size),
@@ -1756,6 +1858,7 @@ impl HostHeap {
             if enough {
                 self.too_long.fetch_min(n as u32, std::sync::atomic::Ordering::Relaxed);
             }
+            DYNAMIC_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
             #[cfg(feature = "diagnostics")]
@@ -1768,6 +1871,9 @@ impl HostHeap {
         };
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
+        if first + n > DYNAMIC as usize {
+            DYNAMIC_EXPANDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         taken[first..first + n].fill(true);
         self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
         *next = ((first + n) % end) as u32;
@@ -2169,11 +2275,7 @@ impl HostHeap {
     /// away `AWAY_MS` after it was first found away
     /// (`VICTORY_TEXTURE_AWAY_MS`; 0: at once, as before).
     pub(crate) fn texture_slot_gone(&self, index: u32) -> bool {
-        const AWAY_MS: u64 = 3000;
-        static WAIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-        let wait = *WAIT.get_or_init(|| {
-            std::env::var("VICTORY_TEXTURE_AWAY_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(AWAY_MS)
-        });
+        let wait = victory_core::tunables::known::TEXTURE_AWAY_MS.get() as u64;
         let _made = self.made.lock(index);
         let Some(key) = self.made.get(index).filter(|&key| key != 0) else {
             return false;
@@ -2623,6 +2725,9 @@ impl HostHeap {
     /// `texture`, whether it now holds a view of a texture the title may
     /// fill; `seen` as for [`HostHeap::note_buffer`].
     fn queue_texture(&self, index: u32, texture: bool, seen: bool, frame: u64) {
+        if PUBLISHING.get() {
+            return;
+        }
         let stamp = if tabled_out() { self.tabled_stamp(index) } else { 0 };
         let now = (frame as u32).wrapping_add(1) & !TABLED_READ;
         // A table's slot lately: the draw that reads it uploads its
@@ -3060,8 +3165,7 @@ impl HostHeap {
     /// lost the device to a page fault in the memory of three freed ones.
     /// `VICTORY_SLOT_HOLDS=0`: only the list holds it, as before.
     pub(crate) fn constant_at(&self, index: u32, buffer: &ID3D12Resource, gpu: u64, size: u32) {
-        static HOLDS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let holds = *HOLDS.get_or_init(|| std::env::var_os("VICTORY_SLOT_HOLDS").is_none_or(|v| v != "0"));
+        let holds = victory_core::tunables::known::SLOT_HOLDS.get();
         let Some(host) = host() else { return };
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: gpu,
@@ -3099,6 +3203,56 @@ impl HostHeap {
         // After the descriptor: what it showed is let go when nothing shows
         // it any more.
         self.keep(index, holds.then(|| buffer.clone()));
+    }
+
+    /// Renderer port 5 (`crate::port_cbv`): makes slot `index` (a dynamic
+    /// one) show the constant buffer of `size` bytes at `gpu` of `buffer`
+    /// (title memory in place) with nothing copied: its raw twin a raw view
+    /// of those bytes, which translated shaders read; the slot itself a
+    /// constant buffer view of them where that can be (on 256 bytes), else a
+    /// null one. Whether the twin was made (`false`: the caller copies the
+    /// bytes as before).
+    pub(crate) fn constant_raw_at(&self, index: u32, buffer: &ID3D12Resource, gpu: u64, size: u32) -> bool {
+        let Some(host) = host() else { return false };
+        let Some(twin) = self.twin(index) else { return false };
+        // SAFETY: a live buffer.
+        let (base, width) = unsafe { (buffer.GetGPUVirtualAddress(), buffer.GetDesc().Width) };
+        let Some(offset) = gpu.checked_sub(base).filter(|&o| o < width && crate::port_cbv::raw_ok(o)) else {
+            return false;
+        };
+        let bytes = u64::from(constant_bytes(size)).min(width - offset) & !3;
+        if bytes == 0 {
+            return false;
+        }
+        let raw = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    FirstElement: offset / 4,
+                    NumElements: (bytes / 4) as u32,
+                    StructureByteStride: 0,
+                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                },
+            },
+        };
+        let cbv = D3D12_CONSTANT_BUFFER_VIEW_DESC {
+            BufferLocation: if gpu.is_multiple_of(256) { gpu } else { 0 },
+            SizeInBytes: if gpu.is_multiple_of(256) { constant_bytes(size).min(((width - offset) & !255) as u32) } else { 0 },
+        };
+        let cbv = if cbv.SizeInBytes == 0 { D3D12_CONSTANT_BUFFER_VIEW_DESC::default() } else { cbv };
+        // SAFETY: slots of our heaps; the ranges lie in the live buffer (a
+        // zero location makes a null constant buffer view).
+        unsafe {
+            host.device.CreateConstantBufferView(Some(&cbv), self.at(index));
+            self.put(index);
+            host.device.CreateShaderResourceView(buffer, Some(&raw), twin);
+        }
+        self.twin_made(index, true);
+        self.write_stride(index, 0);
+        self.keep(index, Some(buffer.clone()));
+        true
     }
 
     /// Where a descriptor for slot `index` is made, then [`HostHeap::put`]:
@@ -3210,6 +3364,21 @@ impl HostHeap {
         out.sort_unstable();
         out.dedup();
         out
+    }
+
+    /// Makes host slot `index` from the record at `handle` if it is still
+    /// the one with `key`, whose texture's upload is in the queue now
+    /// (`crate::heap_worker`). The slot's place in the queue of textures
+    /// picked by index was settled when that upload was recorded, and stays
+    /// as it is. False if the title wrote the slot again.
+    pub(crate) fn publish(&self, index: u32, handle: u64, key: u64) -> bool {
+        if record_key(handle) != key {
+            return false;
+        }
+        PUBLISHING.set(true);
+        let shown = self.mirror(index, handle, true).is_some();
+        PUBLISHING.set(false);
+        shown
     }
 
     /// Makes host slot `index` from the record the title has at `handle`
@@ -3449,7 +3618,7 @@ fn staged(sampler: bool, which: u32) -> Option<D3D12_CPU_DESCRIPTOR_HANDLE> {
     }
     let stage = STAGE
         .get_or_init(|| {
-            if std::env::var_os("VICTORY_VIEW_COPY").is_some_and(|v| v == "0") {
+            if !victory_core::tunables::known::VIEW_COPY.get() {
                 return None;
             }
             let host = host()?;
@@ -3599,8 +3768,7 @@ pub(crate) fn buffer_extent(view: &View) -> Option<(u64, u64)> {
 /// shows ([`buffer_copy`]). On by default; `VICTORY_VIEW_EXTENT=0` looks the
 /// copy up by the view's range alone, as before.
 fn view_extent() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_EXTENT").is_none_or(|v| v != "0"))
+    victory_core::tunables::known::VIEW_EXTENT.get()
 }
 
 /// The host copy buffer view `view` reads, and the title range (address,
@@ -4141,6 +4309,61 @@ fn constant_bytes(size: u32) -> u32 {
     size.min(LARGEST).next_multiple_of(256)
 }
 
+/// Renderer port 5 ([`crate::port_cbv`]): the constant buffer of `size` bytes
+/// at `gpu` of `buffer` as a constant buffer view at `at` where it can be (on
+/// 256 bytes; else a null one) and a raw view of its bytes at `twin`, which
+/// translated shaders read. `false` (nothing made): not on 16 bytes.
+fn constant_twinned(
+    buffer: &ID3D12Resource,
+    gpu: u64,
+    size: u32,
+    at: D3D12_CPU_DESCRIPTOR_HANDLE,
+    twin: Option<D3D12_CPU_DESCRIPTOR_HANDLE>,
+) -> bool {
+    let Some(host) = host() else { return false };
+    // SAFETY: a live buffer.
+    let (base, width) = unsafe { (buffer.GetGPUVirtualAddress(), buffer.GetDesc().Width) };
+    let Some(offset) = gpu.checked_sub(base).filter(|&o| o < width && crate::port_cbv::raw_ok(o)) else {
+        return false;
+    };
+    let room = width - offset;
+    let cbv = if gpu.is_multiple_of(256) && room >= 256 {
+        D3D12_CONSTANT_BUFFER_VIEW_DESC {
+            BufferLocation: gpu,
+            SizeInBytes: constant_bytes(size).min((room & !255) as u32),
+        }
+    } else {
+        D3D12_CONSTANT_BUFFER_VIEW_DESC::default()
+    };
+    let bytes = u64::from(constant_bytes(size)).min(room) & !3;
+    // SAFETY: slots of our heaps; the ranges lie in the live buffer.
+    unsafe {
+        host.device.CreateConstantBufferView(Some(&cbv), at);
+        if let Some(twin) = twin {
+            let raw = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: DXGI_FORMAT_R32_TYPELESS,
+                ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_SRV {
+                        FirstElement: offset / 4,
+                        NumElements: (bytes / 4) as u32,
+                        StructureByteStride: 0,
+                        Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                    },
+                },
+            };
+            if bytes == 0 {
+                null_buffer_view(twin);
+            } else {
+                host.device.CreateShaderResourceView(buffer, Some(&raw), twin);
+            }
+            crate::port_cbv::twinned();
+        }
+    }
+    true
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
@@ -4161,6 +4384,12 @@ fn make_twinned(
         &View::Constant(address, size) => {
             let shadow = crate::shadow::find(address, u64::from(size))?;
             let gpu = shadow.gpu(address);
+            if crate::port_cbv::on() {
+                // Renderer port 5: shaders read constant buffers as raw bytes
+                // through the twin; a constant buffer view there would be read
+                // raw, with no end on AMD.
+                return constant_twinned(&shadow.buffer, gpu, size, at, twin).then(|| Some(shadow.buffer.clone()));
+            }
             if gpu % 256 != 0 {
                 once!(
                     address = format_args!("{address:#x}"),
@@ -4406,8 +4635,7 @@ pub(crate) static KEPT_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::
 /// shows keeps showing the old one until the new is made;
 /// `VICTORY_KEEP_VIEWS=0` makes it null at once, as before.
 fn keep_views() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_KEEP_VIEWS").is_none_or(|v| v != "0"))
+    victory_core::tunables::known::KEEP_VIEWS.get()
 }
 
 /// What the texture view a slot is written with has to do with the one it
@@ -4567,8 +4795,7 @@ pub(crate) fn pop_causes() -> [u64; 4] {
 /// Whether a slot already made from its record is told so without the lock
 /// (`VICTORY_QUICK_MIRROR=0`: with it, as before).
 fn quick_mirror() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_QUICK_MIRROR").is_none_or(|v| v != "0"))
+    victory_core::tunables::known::QUICK_MIRROR.get()
 }
 
 /// The records last seen of a heap, held ([`HostHeap::copied_begin`]).
@@ -5661,6 +5888,39 @@ mod tests {
         // Long after the last table, a write is due at once.
         heap.queue_texture(2, true, false, frame + 3 + TABLED_FRAMES);
         assert_eq!(slots(frame + 3 + TABLED_FRAMES), [2]);
+    }
+
+    #[test]
+    fn dynamic_slots_rebalance_only_an_overflowing_capped_heap() {
+        let capped_null = PORTABLE_VIEWS - 1;
+        let retail_count = 1_245_184;
+        assert_eq!(dynamic_slots(retail_count, capped_null, None, true), 606_784);
+        assert_eq!(dynamic_slots(retail_count, capped_null, Some(DYNAMIC), true), DYNAMIC);
+        assert_eq!(dynamic_slots(retail_count, capped_null, Some(500_000), true), 500_000);
+        assert_eq!(dynamic_slots(retail_count, capped_null, Some(10), true), DYNAMIC);
+        assert_eq!(
+            dynamic_slots(retail_count, capped_null, Some(u32::MAX), true),
+            capped_null - (1 << 16),
+        );
+        assert_eq!(dynamic_slots(capped_null - DYNAMIC, capped_null, None, true), DYNAMIC);
+        let uncapped_null = 2_000_000 - 1;
+        assert_eq!(dynamic_slots(retail_count, uncapped_null, None, true), uncapped_null - retail_count);
+        assert_eq!(dynamic_slots(retail_count, uncapped_null, Some(500_000), true), 500_000);
+    }
+
+    #[test]
+    fn dynamic_slots_expand_switch_off_keeps_the_old_split() {
+        let capped_null = PORTABLE_VIEWS - 1;
+        let retail_count = 1_245_184;
+        // Off: a capped host keeps DYNAMIC whatever VICTORY_DYNAMIC_SLOTS says.
+        assert_eq!(dynamic_slots(retail_count, capped_null, None, false), DYNAMIC);
+        assert_eq!(dynamic_slots(retail_count, capped_null, Some(500_000), false), DYNAMIC);
+        // Uncapped hosts are the same either way.
+        let uncapped_null = 2_000_000 - 1;
+        assert_eq!(
+            dynamic_slots(retail_count, uncapped_null, None, false),
+            dynamic_slots(retail_count, uncapped_null, None, true),
+        );
     }
 
     #[test]

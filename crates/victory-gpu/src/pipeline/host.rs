@@ -119,6 +119,24 @@ fn integer_format(f: DXGI_FORMAT) -> bool {
     )
 }
 
+/// Which of the pipeline's color targets are float formats narrower than 32 bits, 4 bits each
+/// ([`victory_shader::emit::RANGE_HALF`], [`victory_shader::emit::RANGE_11_11_10`]): the
+/// ones the console's color block converts by truncation, so a value past their largest is that
+/// largest, not infinity.
+fn target_ranges(targets: &D3D12_RT_FORMAT_ARRAY) -> u32 {
+    use victory_shader::emit::{RANGE_11_11_10, RANGE_HALF};
+    let mut ranges = 0u32;
+    for i in 0..(targets.NumRenderTargets as usize).min(8) {
+        let kind = match targets.RTFormats[i] {
+            DXGI_FORMAT_R16G16B16A16_FLOAT | DXGI_FORMAT_R16G16_FLOAT | DXGI_FORMAT_R16_FLOAT => RANGE_HALF,
+            DXGI_FORMAT_R11G11B10_FLOAT => RANGE_11_11_10,
+            _ => 0,
+        };
+        ranges |= u32::from(kind) << (4 * i);
+    }
+    ranges
+}
+
 /// The title's blend state as the host takes it: blending off on integer
 /// render targets. The console ignores blending there, and titles leave it
 /// on (the world sets it on an `R8_UINT` target), but D3D12 does not allow
@@ -599,7 +617,25 @@ impl HostPipeline {
                 return None;
             }
         };
+        // The pixel shader's color exports, brought into the range of a float target narrower
+        // than 32 bits (the console's color block truncates; the host's conversion gives
+        // infinity past it).
+        let ps_for_targets = g.and_then(|g| {
+            if compute.is_some() {
+                return None;
+            }
+            let (ps, _) = stages.get(1)?;
+            ps.code_for_targets(target_ranges(&g.targets))
+        });
         let code = |i: usize| {
+            if i == 1
+                && let Some(ps) = &ps_for_targets
+            {
+                return D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: ps.as_ptr().cast(),
+                    BytecodeLength: ps.len(),
+                };
+            }
             stages.get(i).and_then(|(s, _)| s.translated()).map_or(
                 D3D12_SHADER_BYTECODE::default(),
                 |t| D3D12_SHADER_BYTECODE {
@@ -1168,6 +1204,28 @@ mod tests {
             t.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
         }
         b
+    }
+
+    #[test]
+    fn narrow_float_targets_are_named_by_position() {
+        use victory_shader::emit::{RANGE_11_11_10, RANGE_HALF};
+        let t = targets(&[
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+            DXGI_FORMAT_R16G16B16A16_FLOAT,
+            DXGI_FORMAT_R32G32B32A32_FLOAT,
+            DXGI_FORMAT_R11G11B10_FLOAT,
+            DXGI_FORMAT_R16_FLOAT,
+            DXGI_FORMAT_R16G16_FLOAT,
+        ]);
+        let want = u32::from(RANGE_HALF) << 4
+            | u32::from(RANGE_11_11_10) << 12
+            | u32::from(RANGE_HALF) << 16
+            | u32::from(RANGE_HALF) << 20;
+        assert_eq!(target_ranges(&t), want);
+        // A format past the pipeline's count is not looked at.
+        let mut t = targets(&[DXGI_FORMAT_R8G8B8A8_UNORM]);
+        t.RTFormats[1] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        assert_eq!(target_ranges(&t), 0);
     }
 
     #[test]

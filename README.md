@@ -98,6 +98,10 @@ In short; the reasons and the measurements are in [docs/findings.md](docs/findin
   to title memory (from fxceless and Geckomacabre, on by default here).
 - **Frame record and replay** with per-pass times and shader variants compared
   turn by turn ([docs/replay.md](docs/replay.md)).
+- **A read-only debug MCP server, off unless set** (`VICTORY_MCP=<port>`, for
+  example 47820): on 127.0.0.1 only, POST `/mcp`, with the frame meter, recent log
+  lines, shader and pipeline events, the device-lost report and a screenshot
+  (written to `K:\Leonida\avatarmanz\shots`).
 
 ## Credits
 

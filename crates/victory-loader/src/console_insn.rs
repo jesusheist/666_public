@@ -24,8 +24,7 @@ const CONTINUE_EXECUTION: i32 = -1;
 /// processor time in Windows per 9 s frame. On by default; `VICTORY_CLZERO_ASK=1` asks every
 /// time, as before.
 fn remembers() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CLZERO_ASK").is_none_or(|v| v != "1"))
+    !victory_core::tunables::known::CLZERO_ASK.get()
 }
 
 /// Answers a remembered region gives before Windows is asked about it again: one freed or
@@ -53,8 +52,7 @@ static ZEROED: AtomicU64 = AtomicU64::new(0);
 /// `pause` either, and the loop looks at its value again after it. On by default;
 /// `VICTORY_PATCH_WAITS=0` emulates each time, as before.
 fn patches_waits() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_PATCH_WAITS").is_none_or(|v| v != "0"))
+    victory_core::tunables::known::PATCH_WAITS.get()
 }
 
 /// What replaces the 3 bytes of a wait instruction.
@@ -72,8 +70,7 @@ fn wait_patch(what: ConsoleOnly) -> Option<[u8; 3]> {
 /// some kilobytes each; ten times what the wait instructions raised. On by default;
 /// `VICTORY_PATCH_CLZERO=0` emulates each time, as before.
 fn patches_clzero() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_PATCH_CLZERO").is_none_or(|v| v != "0"))
+    victory_core::tunables::known::PATCH_CLZERO.get()
 }
 
 /// `jmp rel32` at `at` to `to`, if it reaches.
@@ -136,7 +133,8 @@ unsafe fn patch_clzero(at: usize, code: &[u8]) -> bool {
         return false;
     };
     let mut stubs = STUBS.lock().unwrap_or_else(|e| e.into_inner());
-    if stubs.is_none() {
+    // (A place out of reach of this `at`, as when code lies far from where the first loop was, is made again.)
+    if stubs.is_none_or(|(place, _)| place.abs_diff(at) >= 0x7000_0000) {
         *stubs = near(at).map(|place| (place, 0));
     }
     let Some((place, used)) = stubs.as_mut() else {

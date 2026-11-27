@@ -75,12 +75,7 @@ use crate::shadow::Shadow;
 /// The landing tells the guards (`crate::watch::landing`), so a texture
 /// made from older bytes is made again. This is why stage 2 is its own.
 pub(super) fn stage() -> u32 {
-    static STAGE: OnceLock<u32> = OnceLock::new();
-    *STAGE.get_or_init(|| match std::env::var("VICTORY_CARD_STEPS").ok().as_deref() {
-        Some("1") => 1,
-        Some("2") => 2,
-        _ => 0,
-    })
+    victory_core::tunables::known::CARD_STEPS.get() as u32
 }
 
 /// Whether a copy at its place in a list ([`place`]) is only in the way of

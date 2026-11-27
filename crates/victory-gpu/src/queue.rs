@@ -71,8 +71,7 @@ fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// and every submission runs when it is made (as before).
 #[cfg(windows)]
 fn waits() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_QUEUE_WAIT").is_none_or(|v| v != "0"))
+    victory_core::tunables::known::QUEUE_WAIT.get()
 }
 
 /// Whether a submission is held list by list: the lists before the first
@@ -90,8 +89,7 @@ fn waits() -> bool {
 /// before.
 #[cfg(windows)]
 fn split() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_SPLIT_WAITS").is_none_or(|v| v != "0"))
+    victory_core::tunables::known::SPLIT_WAITS.get()
 }
 
 /// Whether a list is cut into host lists at its waits for memory values
@@ -109,8 +107,7 @@ fn split() -> bool {
 /// `VICTORY_CUT_WAITS=0` holds whole lists, as before.
 #[cfg(windows)]
 pub(crate) fn cuts() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    waits() && split() && *ON.get_or_init(|| std::env::var_os("VICTORY_CUT_WAITS").is_none_or(|v| v != "0"))
+    waits() && split() && victory_core::tunables::known::CUT_WAITS.get()
 }
 
 /// Whether a present runs what queues still hold (on by default: a wait
@@ -119,8 +116,7 @@ pub(crate) fn cuts() -> bool {
 /// wait nothing ever meets then stops the title for good.
 #[cfg(windows)]
 fn forces() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_WAIT_FORCE").is_none_or(|v| v != "0"))
+    victory_core::tunables::known::WAIT_FORCE.get()
 }
 
 /// A submission to a queue whose lists are cut at their waits ([`cuts`]).
@@ -851,11 +847,8 @@ impl Written {
 /// when the frame's last submissions land, within microseconds, so every pair
 /// says the card did nothing.
 fn gpu_load() -> u64 {
-    static LOAD: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *LOAD.get_or_init(|| {
-        let ms = std::env::var("VICTORY_GPU_LOAD_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0);
-        ms * (TIMESTAMP_FREQUENCY / 1000)
-    })
+    let ms = victory_core::tunables::known::GPU_LOAD_MS.get().max(0) as u64;
+    ms * (TIMESTAMP_FREQUENCY / 1000)
 }
 
 /// The timestamp written at `at` when the clock says `now`, if a pair's start

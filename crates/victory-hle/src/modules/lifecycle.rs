@@ -95,6 +95,8 @@ pub extern "system" fn UnregisterAppConstrainedChangeNotification(registration: 
 
 /// The window procedure a title window had before ours.
 const TITLE_PROC: PCWSTR = w!("victory.wndproc");
+const SYNC_CURSOR: u32 = wm::WM_APP + 0x315;
+const CURSOR_TOKEN: usize = 0x564b_424d;
 
 pub extern "system" fn CreateWindowExW(
     ex_style: u32,
@@ -110,7 +112,8 @@ pub extern "system" fn CreateWindowExW(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
-    let (x, y, width, height) = fit(parent, x, y, width, height);
+    let (x, y, width, height) = fit(parent, x, y, width, height, style, ex_style, !menu.is_null());
+    let ex_style = ex_style | no_activate(parent);
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExW(
@@ -136,7 +139,8 @@ pub extern "system" fn CreateWindowExA(
     instance: HINSTANCE,
     param: *const c_void,
 ) -> HWND {
-    let (x, y, width, height) = fit(parent, x, y, width, height);
+    let (x, y, width, height) = fit(parent, x, y, width, height, style, ex_style, !menu.is_null());
+    let ex_style = ex_style | no_activate(parent);
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExA(
@@ -147,13 +151,38 @@ pub extern "system" fn CreateWindowExA(
     hwnd
 }
 
+/// `VICTORY_NO_FOCUS_STEAL=1`: a top-level window of the title is made with
+/// `WS_EX_NOACTIVATE`, so showing it (or a click on it) never takes the
+/// keyboard focus from the window the user is working in. The window is
+/// otherwise a normal one: it can be moved and sized by other tools.
+fn no_activate(parent: HWND) -> u32 {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| std::env::var_os("VICTORY_NO_FOCUS_STEAL").is_some_and(|v| v == "1"));
+    if on && parent.is_null() { wm::WS_EX_NOACTIVATE } else { 0 }
+}
+
 /// A console title sizes its window to its render target (
 /// the title: 3840x2160 on a Series X), which can exceed the host's screen.
 /// A top-level window larger than the work area is shrunk to fit, keeping
 /// its proportions, and centred; what it shows is scaled to it (the swap
 /// chain stretches). `VICTORY_WINDOW_MAX=WIDTHxHEIGHT` applies a smaller
 /// limit without changing the title's render targets.
-fn fit(parent: HWND, x: i32, y: i32, width: i32, height: i32) -> (i32, i32, i32, i32) {
+fn fit(
+    parent: HWND,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+    style: u32,
+    ex_style: u32,
+    has_menu: bool,
+) -> (i32, i32, i32, i32) {
+    if parent.is_null() {
+        if let Some(placed) = placement(style, ex_style, has_menu) {
+            tracing::info!(?placed, "title window placed by VICTORY_WINDOW");
+            return placed;
+        }
+    }
     let mut area = RECT::default();
     // SAFETY: `area` receives the primary monitor's work area.
     let known =
@@ -209,6 +238,29 @@ fn fit_with_limit(
     fit_into(&bounded, width, height)
 }
 
+/// `VICTORY_WINDOW=x,y,width,height`: where a top-level title window opens
+/// (outer position in desktop coordinates; a monitor left of the primary one
+/// has negative x) and its client size, so 1280,720 is a 1280x720 picture
+/// area. The outer size adds the frame of the window's style. Unset or
+/// malformed: the window is placed as usual.
+fn placement(style: u32, ex_style: u32, has_menu: bool) -> Option<(i32, i32, i32, i32)> {
+    let (x, y, w, h) = parse_placement(&std::env::var("VICTORY_WINDOW").ok()?)?;
+    let mut frame = RECT { left: 0, top: 0, right: w, bottom: h };
+    // SAFETY: `frame` is a local rectangle the call grows by the frame.
+    if unsafe { wm::AdjustWindowRectEx(&mut frame, style, i32::from(has_menu), ex_style) } == 0 {
+        return Some((x, y, w, h));
+    }
+    Some((x, y, frame.right - frame.left, frame.bottom - frame.top))
+}
+
+fn parse_placement(text: &str) -> Option<(i32, i32, i32, i32)> {
+    let v: Vec<i32> = text.split(',').map(|s| s.trim().parse().ok()).collect::<Option<_>>()?;
+    match v[..] {
+        [x, y, w, h] if w > 0 && h > 0 => Some((x, y, w, h)),
+        _ => None,
+    }
+}
+
 /// `width` x `height` scaled down to fit `area`, or unchanged if it fits
 /// (or is `CW_USEDEFAULT`).
 fn fit_into(area: &RECT, width: i32, height: i32) -> (i32, i32) {
@@ -226,18 +278,36 @@ fn fit_into(area: &RECT, width: i32, height: i32) -> (i32, i32) {
     )
 }
 
-/// Puts our procedure in front of the title's.
-fn hook(hwnd: HWND) {
+/// Installs the lifecycle and input procedure once on a window in our process.
+pub(crate) fn hook(hwnd: HWND) {
     if hwnd.is_null() {
         return;
     }
-    // SAFETY: a window this thread just created. The title's procedure is
-    // stored before ours can run.
+    static INSTALL: Mutex<()> = Mutex::new(());
+    let _install = INSTALL.lock().unwrap_or_else(|err| err.into_inner());
+    let procedure = window_proc as *const () as isize;
+    // SAFETY: the caller has checked ownership or just created the window.
+    // Its previous procedure is stored before ours can be called.
     unsafe {
-        let title = wm::GetWindowLongPtrW(hwnd, wm::GWLP_WNDPROC);
-        wm::SetPropW(hwnd, TITLE_PROC, title as *mut c_void);
-        wm::SetWindowLongPtrW(hwnd, wm::GWLP_WNDPROC, window_proc as *const () as isize);
+        let previous = wm::GetWindowLongPtrW(hwnd, wm::GWLP_WNDPROC);
+        if previous == procedure || previous == 0 {
+            return;
+        }
+        if wm::SetPropW(hwnd, TITLE_PROC, previous as *mut c_void) == 0 {
+            tracing::warn!("could not store the game window procedure");
+            return;
+        }
+        if wm::SetWindowLongPtrW(hwnd, wm::GWLP_WNDPROC, procedure) == 0 {
+            wm::RemovePropW(hwnd, TITLE_PROC);
+            tracing::warn!("could not attach the game window input handler");
+        }
     }
+}
+
+/// Refreshes the visible cursor on the window's own UI thread.
+pub(crate) fn sync_cursor(hwnd: HWND) {
+    // SAFETY: the private message carries only an integer token.
+    unsafe { wm::PostMessageW(hwnd, SYNC_CURSOR, CURSOR_TOKEN, 0) };
 }
 
 extern "system" fn window_proc(
@@ -246,6 +316,25 @@ extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    if victory_gpu::window_mode_message(hwnd as usize, message, wparam, lparam) {
+        return 0;
+    }
+    if message == SYNC_CURSOR && wparam == CURSOR_TOKEN {
+        // SAFETY: the foreground window owns the visible cursor shape.
+        unsafe {
+            if wm::GetForegroundWindow() == hwnd {
+                let captured = super::gameinput::cursor::captured();
+                let cursor = if captured {
+                    std::ptr::null_mut()
+                } else {
+                    wm::LoadCursorW(std::ptr::null_mut(), wm::IDC_ARROW)
+                };
+                wm::SetCursor(cursor);
+                tracing::debug!(captured, "cursor applied on game window thread");
+            }
+        }
+        return 0;
+    }
     // A user close (close button, Alt+F4, window or taskbar menu); a
     // console title never sees one, nor a WM_CLOSE from it.
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_CLOSE as usize {
@@ -261,6 +350,30 @@ extern "system" fn window_proc(
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_KEYMENU as usize {
         return 0;
     }
+    if drag::handle(hwnd, message, wparam) {
+        return 0;
+    }
+    // The mouse cursor for keyboard and mouse play (`gameinput::cursor`):
+    // hidden over the window while captured, captured by a click, freed when
+    // the window loses focus. The title still sees every message.
+    match message {
+        wm::WM_SETCURSOR
+            if super::gameinput::cursor::captured() && lparam as u32 & 0xFFFF == wm::HTCLIENT =>
+        {
+            // SAFETY: no cursor while it is over our client area.
+            unsafe { wm::SetCursor(std::ptr::null_mut()) };
+            return 1;
+        }
+        wm::WM_LBUTTONDOWN | wm::WM_RBUTTONDOWN | wm::WM_MBUTTONDOWN => {
+            super::gameinput::cursor::click();
+        }
+        wm::WM_KILLFOCUS => super::gameinput::cursor::release(),
+        // Sizing or moving the window: the cursor is the user's until the
+        // loop ends (a clip following a shrinking client area collapses it).
+        wm::WM_ENTERSIZEMOVE => super::gameinput::cursor::size_move(true),
+        wm::WM_EXITSIZEMOVE => super::gameinput::cursor::size_move(false),
+        _ => {}
+    }
     // SAFETY: the procedure `hook` stored, called the way the system would.
     unsafe {
         let title = wm::GetPropW(hwnd, TITLE_PROC);
@@ -269,6 +382,197 @@ extern "system" fn window_proc(
         }
         let title = std::mem::transmute::<*mut c_void, wm::WNDPROC>(title);
         wm::CallWindowProcW(title, hwnd, message, wparam, lparam)
+    }
+}
+
+/// Moving and sizing the window by its frame without the system's modal
+/// loop. A click on the title bar or a border makes `DefWindowProc` run a
+/// loop on the window's thread, which is the title's: the title gets no
+/// frames, input or audio pump until the button is released. Here the
+/// press starts a drag that is only state; the mouse messages that follow
+/// (the window holds the mouse capture) move or size the window one
+/// `SetWindowPos` at a time, and the title's own loop keeps running between
+/// them. `VICTORY_DRAG_FIX=0` leaves the system's loop in place.
+mod drag {
+    use std::sync::Mutex;
+
+    use windows_sys::Win32::Foundation::{HWND, POINT, RECT, WPARAM};
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetCapture, ReleaseCapture, SetCapture};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{self as wm};
+
+    /// A drag in progress: the window, the hit-test code that started it,
+    /// and where the cursor and the window were then.
+    #[derive(Clone, Copy)]
+    struct Drag {
+        hwnd: usize,
+        hit: u32,
+        cursor: POINT,
+        rect: RECT,
+    }
+
+    /// The left button flag in a mouse message's `wparam`.
+    const MK_LBUTTON: usize = 0x0001;
+
+    static ACTIVE: Mutex<Option<Drag>> = Mutex::new(None);
+
+    fn enabled() -> bool {
+        victory_gpu::tunables::known::DRAG_FIX.get()
+    }
+
+    fn active() -> std::sync::MutexGuard<'static, Option<Drag>> {
+        ACTIVE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn sizing(hit: u32) -> bool {
+        (wm::HTLEFT..=wm::HTBOTTOMRIGHT).contains(&hit)
+    }
+
+    /// The window's rectangle after the cursor moved by (`dx`, `dy`) in a
+    /// drag begun on `hit`; a size never goes below `min`.
+    pub(super) fn dragged_rect(hit: u32, start: &RECT, dx: i32, dy: i32, min: (i32, i32)) -> RECT {
+        let mut r = *start;
+        if hit == wm::HTCAPTION {
+            r.left += dx;
+            r.right += dx;
+            r.top += dy;
+            r.bottom += dy;
+            return r;
+        }
+        let left = matches!(hit, wm::HTLEFT | wm::HTTOPLEFT | wm::HTBOTTOMLEFT);
+        let right = matches!(hit, wm::HTRIGHT | wm::HTTOPRIGHT | wm::HTBOTTOMRIGHT);
+        let top = matches!(hit, wm::HTTOP | wm::HTTOPLEFT | wm::HTTOPRIGHT);
+        let bottom = matches!(hit, wm::HTBOTTOM | wm::HTBOTTOMLEFT | wm::HTBOTTOMRIGHT);
+        if left {
+            r.left = (start.left + dx).min(start.right - min.0);
+        }
+        if right {
+            r.right = (start.right + dx).max(start.left + min.0);
+        }
+        if top {
+            r.top = (start.top + dy).min(start.bottom - min.1);
+        }
+        if bottom {
+            r.bottom = (start.bottom + dy).max(start.top + min.1);
+        }
+        r
+    }
+
+    fn end(hwnd: HWND) {
+        *active() = None;
+        // SAFETY: gives back the capture this window took (a no-op without).
+        unsafe {
+            if GetCapture() == hwnd {
+                ReleaseCapture();
+            }
+        }
+    }
+
+    /// True when the message was ours and the title must not see it.
+    pub(super) fn handle(hwnd: HWND, message: u32, wparam: WPARAM) -> bool {
+        if !enabled() {
+            return false;
+        }
+        match message {
+            wm::WM_NCLBUTTONDOWN => {
+                let hit = wparam as u32;
+                if hit != wm::HTCAPTION && !sizing(hit) {
+                    return false;
+                }
+                let mut cursor = POINT { x: 0, y: 0 };
+                let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+                // SAFETY: plain queries and the capture for this window.
+                unsafe {
+                    // A maximized window is restored by the system's own
+                    // handling of the drag, and borders do nothing then.
+                    if wm::IsZoomed(hwnd) != 0
+                        || wm::GetCursorPos(&mut cursor) == 0
+                        || wm::GetWindowRect(hwnd, &mut rect) == 0
+                    {
+                        return false;
+                    }
+                    *active() = Some(Drag { hwnd: hwnd as usize, hit, cursor, rect });
+                    SetCapture(hwnd);
+                }
+                true
+            }
+            wm::WM_MOUSEMOVE => {
+                let Some(drag) = active().filter(|d| d.hwnd == hwnd as usize) else {
+                    return false;
+                };
+                if wparam & MK_LBUTTON == 0 {
+                    end(hwnd);
+                    return true;
+                }
+                let mut now = POINT { x: 0, y: 0 };
+                // SAFETY: a query, then one move or size of our window.
+                unsafe {
+                    if wm::GetCursorPos(&mut now) == 0 {
+                        return true;
+                    }
+                    let min = (
+                        wm::GetSystemMetrics(wm::SM_CXMINTRACK),
+                        wm::GetSystemMetrics(wm::SM_CYMINTRACK),
+                    );
+                    let r = dragged_rect(
+                        drag.hit,
+                        &drag.rect,
+                        now.x - drag.cursor.x,
+                        now.y - drag.cursor.y,
+                        min,
+                    );
+                    wm::SetWindowPos(
+                        hwnd,
+                        std::ptr::null_mut(),
+                        r.left,
+                        r.top,
+                        r.right - r.left,
+                        r.bottom - r.top,
+                        wm::SWP_NOZORDER | wm::SWP_NOACTIVATE,
+                    );
+                }
+                true
+            }
+            wm::WM_LBUTTONUP | wm::WM_CANCELMODE | wm::WM_CAPTURECHANGED => {
+                if active().is_some_and(|d| d.hwnd == hwnd as usize) {
+                    end(hwnd);
+                    return message != wm::WM_CAPTURECHANGED;
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        const START: RECT = RECT { left: 100, top: 100, right: 500, bottom: 400 };
+        const MIN: (i32, i32) = (136, 39);
+
+        #[test]
+        fn a_caption_drag_moves_without_sizing() {
+            let r = dragged_rect(wm::HTCAPTION, &START, 30, -20, MIN);
+            assert_eq!((r.left, r.top, r.right, r.bottom), (130, 80, 530, 380));
+        }
+
+        #[test]
+        fn borders_move_only_their_own_edges() {
+            let r = dragged_rect(wm::HTBOTTOMRIGHT, &START, 50, 60, MIN);
+            assert_eq!((r.left, r.top, r.right, r.bottom), (100, 100, 550, 460));
+            let r = dragged_rect(wm::HTTOPLEFT, &START, 10, 20, MIN);
+            assert_eq!((r.left, r.top, r.right, r.bottom), (110, 120, 500, 400));
+            let r = dragged_rect(wm::HTRIGHT, &START, -20, 99, MIN);
+            assert_eq!((r.left, r.top, r.right, r.bottom), (100, 100, 480, 400));
+        }
+
+        #[test]
+        fn a_size_never_goes_below_the_minimum_and_the_far_edge_stays() {
+            let r = dragged_rect(wm::HTLEFT, &START, 900, 0, MIN);
+            assert_eq!((r.left, r.right), (500 - 136, 500));
+            let r = dragged_rect(wm::HTBOTTOM, &START, 0, -900, MIN);
+            assert_eq!((r.top, r.bottom), (100, 100 + 39));
+        }
     }
 }
 
@@ -407,6 +711,23 @@ mod tests {
     use super::*;
 
     extern "system" fn noop(_: u8, _: *mut c_void) {}
+
+    #[test]
+    fn window_placement_parses() {
+        assert_eq!(parse_placement("-1920, 0,1280,720"), Some((-1920, 0, 1280, 720)));
+        assert_eq!(parse_placement("0,0,0,720"), None);
+        assert_eq!(parse_placement("1,2,3"), None);
+        assert_eq!(parse_placement("a,b,c,d"), None);
+    }
+
+    #[test]
+    fn window_placement_adds_the_frame() {
+        let overlapped = wm::WS_OVERLAPPEDWINDOW;
+        let mut frame = RECT { left: 0, top: 0, right: 1280, bottom: 720 };
+        // SAFETY: a local rectangle.
+        unsafe { wm::AdjustWindowRectEx(&mut frame, overlapped, 0, 0) };
+        assert!(frame.right - frame.left > 1280 && frame.bottom - frame.top > 720);
+    }
 
     #[test]
     fn registrations_come_and_go() {

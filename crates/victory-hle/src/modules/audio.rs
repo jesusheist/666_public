@@ -493,13 +493,24 @@ impl Xma {
     }
 
     /// Fills every enabled context's output as far as it has room.
-    fn pump(&self) {
+    ///
+    /// Returns the voices that were enabled and how many of those had an
+    /// empty ring when the pass began (the title had played all of it).
+    fn pump(&self) -> (u32, u32) {
         let start = Instant::now();
         let mut active = 0;
+        let mut empty = 0;
         for index in 0..self.voices.len() as u32 {
             if let (Some(context), Some(voice)) =
                 (self.context(index), &mut *lock(&self.voices[index as usize]))
             {
+                let size = context.field(0, 22, 5);
+                if size != 0
+                    && context.field(1, 31, 1) == 1
+                    && context.field(0, 27, 5) % size == context.field(9, 0, 5) % size
+                {
+                    empty += 1;
+                }
                 pump(context, voice);
                 active += 1;
             }
@@ -508,6 +519,7 @@ impl Xma {
         if took.as_millis() >= 4 {
             tracing::debug!(active, ms = took.as_millis(), "slow XMA decoding pass");
         }
+        (active, empty)
     }
 }
 
@@ -682,6 +694,94 @@ fn dump_input(index: u32, context: Context) {
     let _ = std::fs::write(dir.join(format!("{n:02}-{index}.xma")), input.unwrap_or_default());
 }
 
+/// `VICTORY_AUDIO_BOOST=1`: the decoding thread runs at time-critical
+/// priority (and as an MMCSS "Pro Audio" task), and logs a counter line
+/// every 5 s.
+fn audio_boost() -> bool {
+    victory_gpu::tunables::known::AUDIO_BOOST.get()
+}
+
+#[cfg(windows)]
+fn raise_decoder_priority() {
+    use windows_sys::Win32::System::Threading::{
+        AvSetMmThreadCharacteristicsW, GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
+    };
+    let task: Vec<u16> = "Pro Audio\0".encode_utf16().collect();
+    let mut index = 0u32;
+    // SAFETY: plain thread settings; `task` is NUL-terminated and outlives the call.
+    let (mmcss, priority) = unsafe {
+        let mmcss = AvSetMmThreadCharacteristicsW(task.as_ptr(), &mut index);
+        (
+            !mmcss.is_null(),
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL) != 0,
+        )
+    };
+    tracing::info!(mmcss, priority, "XMA decoder thread boosted (VICTORY_AUDIO_BOOST)");
+}
+
+#[cfg(not(windows))]
+fn raise_decoder_priority() {}
+
+/// Counters for the decoding thread, logged every 5 s under
+/// `VICTORY_AUDIO_BOOST=1`.
+struct DecoderStats {
+    since: Instant,
+    last_end: Instant,
+    passes: u32,
+    slow: u32,
+    late: u32,
+    max_gap_ms: u128,
+    max_pass_ms: u128,
+    empty_rings: u32,
+    max_active: u32,
+}
+
+impl DecoderStats {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            since: now,
+            last_end: now,
+            passes: 0,
+            slow: 0,
+            late: 0,
+            max_gap_ms: 0,
+            max_pass_ms: 0,
+            empty_rings: 0,
+            max_active: 0,
+        }
+    }
+
+    /// One pass that began at `begin`. Late: the thread ran more than 8 ms
+    /// after its last pass (it asked for 2). Slow: the pass took 4 ms or more.
+    fn pass(&mut self, begin: Instant, active: u32, empty: u32) {
+        let end = Instant::now();
+        let gap = begin.duration_since(self.last_end).as_millis();
+        let took = end.duration_since(begin).as_millis();
+        self.last_end = end;
+        self.passes += 1;
+        self.slow += u32::from(took >= 4);
+        self.late += u32::from(gap > 8);
+        self.max_gap_ms = self.max_gap_ms.max(gap);
+        self.max_pass_ms = self.max_pass_ms.max(took);
+        self.empty_rings += empty;
+        self.max_active = self.max_active.max(active);
+        if end.duration_since(self.since).as_secs() >= 5 {
+            tracing::info!(
+                passes = self.passes,
+                slow = self.slow,
+                late = self.late,
+                max_gap_ms = self.max_gap_ms,
+                max_pass_ms = self.max_pass_ms,
+                empty_rings = self.empty_rings,
+                max_voices = self.max_active,
+                "XMA decoder, last 5 s"
+            );
+            *self = Self::new();
+        }
+    }
+}
+
 /// Starts the decoding thread on the first enabled voice, and has it fill
 /// rings now: a voice just enabled or read from.
 fn wake_decoder() {
@@ -691,8 +791,17 @@ fn wake_decoder() {
             std::thread::Builder::new()
                 .name("victory XMA decoder".into())
                 .spawn(|| {
+                    let boost = audio_boost();
+                    if boost {
+                        raise_decoder_priority();
+                    }
+                    let mut stats = DecoderStats::new();
                     loop {
-                        xma().pump();
+                        let begin = Instant::now();
+                        let (active, empty) = xma().pump();
+                        if boost {
+                            stats.pass(begin, active, empty);
+                        }
                         // A 256-byte output block lasts 2.7 ms at 48 kHz mono.
                         std::thread::park_timeout(std::time::Duration::from_millis(2));
                     }

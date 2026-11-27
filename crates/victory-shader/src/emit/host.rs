@@ -50,8 +50,30 @@ fn format(e: &SigElement) -> DXGI_FORMAT {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// A test's choice of the float format its pixel shaders draw into
+    /// (`R16G16B16A16_FLOAT` or the default `R32G32B32A32_FLOAT`), for its thread only.
+    pub(super) static TEST_TARGET: std::cell::Cell<Option<DXGI_FORMAT>> = const { std::cell::Cell::new(None) };
+}
+
+/// A 16-bit float's value (readback of a half target in the tests).
+#[cfg(test)]
+pub(super) fn half_to_f32(h: u16) -> f32 {
+    let sign = if h & 0x8000 != 0 { -1.0f32 } else { 1.0 };
+    let (exp, frac) = ((h >> 10) & 0x1F, f32::from(h & 0x3FF));
+    match exp {
+        0 => sign * frac * 2f32.powi(-24),
+        0x1F if frac == 0.0 => sign * f32::INFINITY,
+        0x1F => f32::NAN,
+        e => sign * (1.0 + frac / 1024.0) * 2f32.powi(i32::from(e) - 15),
+    }
+}
+
 fn target_format(e: &SigElement) -> DXGI_FORMAT {
     match e.comp {
+        #[cfg(test)]
+        9 if TEST_TARGET.get().is_some() => TEST_TARGET.get().unwrap(),
         9 => DXGI_FORMAT_R32G32B32A32_FLOAT,
         4 => DXGI_FORMAT_R32G32B32A32_SINT,
         _ => DXGI_FORMAT_R32G32B32A32_UINT,
@@ -76,6 +98,10 @@ impl Host {
                     && let Some(debug) = debug
                 {
                     debug.EnableDebugLayer();
+                    #[cfg(test)]
+                    if !warp && std::env::var_os("VICTORY_NVIDIA_HARDWARE_TESTS").is_some_and(|v| v == "1") {
+                        debug.cast::<ID3D12Debug1>().expect("GPU validation interface").SetEnableGPUBasedValidation(true);
+                    }
                 }
             }
             let mut device: Option<ID3D12Device> = None;
@@ -612,6 +638,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         root_srvs: Vec::new(),
         root_uavs: Vec::new(),
         root_indexed_views: Vec::new(),
+        half_views: Vec::new(),
     }
 }
 
@@ -721,12 +748,16 @@ impl Host {
                 .map_err(err)?;
                 r.ok_or_else(|| "no resource".to_string())
             };
+            let rt_format = TEST_TARGET.get().unwrap_or(DXGI_FORMAT_R32G32B32A32_FLOAT);
+            let half = rt_format == DXGI_FORMAT_R16G16B16A16_FLOAT;
+            let mut target_desc = tex_desc(w, h, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET);
+            target_desc.Format = rt_format;
             let target = make(
                 D3D12_HEAP_TYPE_DEFAULT,
-                &tex_desc(w, h, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET),
+                &target_desc,
                 D3D12_RESOURCE_STATE_RENDER_TARGET,
                 Some(&D3D12_CLEAR_VALUE {
-                    Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+                    Format: rt_format,
                     Anonymous: D3D12_CLEAR_VALUE_0 { Color: [0.0; 4] },
                 }),
             )?;
@@ -904,7 +935,8 @@ impl Host {
                 D3D12_RESOURCE_STATE_RENDER_TARGET,
                 D3D12_RESOURCE_STATE_COPY_SOURCE,
             )]);
-            let pitch = (w as usize * 16).next_multiple_of(256);
+            let texel_bytes = if half { 8 } else { 16 };
+            let pitch = (w as usize * texel_bytes).next_multiple_of(256);
             let readback = make(
                 D3D12_HEAP_TYPE_READBACK,
                 &buf_desc((pitch * h as usize) as u64),
@@ -918,7 +950,7 @@ impl Host {
                     PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
                         Offset: 0,
                         Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
-                            Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+                            Format: rt_format,
                             Width: w,
                             Height: h,
                             Depth: 1,
@@ -955,6 +987,14 @@ impl Host {
             readback.Map(0, None, Some(&mut p)).map_err(err)?;
             let mut out = Vec::with_capacity((w * h) as usize);
             for y in 0..h as usize {
+                if half {
+                    let row = std::slice::from_raw_parts(
+                        p.cast::<u8>().add(y * pitch).cast::<[u16; 4]>(),
+                        w as usize,
+                    );
+                    out.extend(row.iter().map(|t| t.map(half_to_f32)));
+                    continue;
+                }
                 let row = std::slice::from_raw_parts(
                     p.cast::<u8>().add(y * pitch).cast::<[f32; 4]>(),
                     w as usize,
@@ -1041,6 +1081,34 @@ pub struct Dispatch<'a> {
 
 #[cfg(test)]
 impl Host {
+    pub(super) fn check_hardware_validation(&self) {
+        if std::env::var_os("VICTORY_D3D12_DEBUG").is_none() {
+            return;
+        }
+        let queue: ID3D12InfoQueue = self.device.cast().expect("D3D12 debug layer");
+        let (mut errors, mut warnings) = (0, 0);
+        // SAFETY: storage is aligned for the message and sized for its inline text.
+        unsafe {
+            for i in 0..queue.GetNumStoredMessages() {
+                let mut size = 0;
+                queue.GetMessage(i, None, &mut size).unwrap();
+                let mut storage = vec![0u64; size.div_ceil(8)];
+                let message = storage.as_mut_ptr().cast::<D3D12_MESSAGE>();
+                queue.GetMessage(i, Some(message), &mut size).unwrap();
+                let message = &*message;
+                if message.Severity.0 <= D3D12_MESSAGE_SEVERITY_WARNING.0 {
+                    let text = std::slice::from_raw_parts(message.pDescription, message.DescriptionByteLength);
+                    eprintln!("D3D12 #{}: {}", message.ID.0, String::from_utf8_lossy(text).trim_end_matches('\0'));
+                    if message.Severity == D3D12_MESSAGE_SEVERITY_WARNING { warnings += 1 } else { errors += 1 }
+                }
+            }
+            assert_eq!(queue.GetNumMessagesDiscardedByMessageCountLimit(), 0);
+        }
+        eprintln!("D3D12 hardware validation: {errors} errors, {warnings} warnings");
+        assert_eq!(errors, 0);
+    }
+
+
     /// Runs a compute pipeline and returns each UAV's contents in heap
     /// order (texels as float bits, row by row).
     pub fn dispatch(
@@ -1049,6 +1117,17 @@ impl Host {
         pso: &ID3D12PipelineState,
         d: &Dispatch,
     ) -> Result<Vec<Vec<u32>>, String> {
+        self.dispatch_repeated(root, pso, d, 1).map(|(output, _)| output)
+    }
+
+    pub(super) fn dispatch_repeated(
+        &self,
+        root: &ID3D12RootSignature,
+        pso: &ID3D12PipelineState,
+        d: &Dispatch,
+        passes: u32,
+    ) -> Result<(Vec<Vec<u32>>, f64), String> {
+        assert!(passes > 0);
         let dev = &self.device;
         // SAFETY: D3D12 calls with descriptions that outlive them; resources
         // stay alive until the fence says the GPU is done.
@@ -1455,7 +1534,44 @@ impl Host {
                 }
             }
             let [x, y, z] = d.groups;
-            list.Dispatch(x, y, z);
+            let timing = if passes > 1 {
+                let mut query: Option<ID3D12QueryHeap> = None;
+                dev.CreateQueryHeap(
+                    &D3D12_QUERY_HEAP_DESC {
+                        Type: D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
+                        Count: 2,
+                        NodeMask: 0,
+                    },
+                    &mut query,
+                ).map_err(err)?;
+                let back = make(
+                    D3D12_HEAP_TYPE_READBACK,
+                    &buffer(16, D3D12_RESOURCE_FLAG_NONE),
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                )?;
+                let query = query.ok_or("no timestamp query heap")?;
+                list.EndQuery(&query, D3D12_QUERY_TYPE_TIMESTAMP, 0);
+                Some((query, back))
+            } else {
+                None
+            };
+            let uav_order = D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                    UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER::default()),
+                },
+                ..Default::default()
+            };
+            for pass in 0..passes {
+                if pass != 0 {
+                    list.ResourceBarrier(std::slice::from_ref(&uav_order));
+                }
+                list.Dispatch(x, y, z);
+            }
+            if let Some((query, back)) = &timing {
+                list.EndQuery(query, D3D12_QUERY_TYPE_TIMESTAMP, 1);
+                list.ResolveQueryData(query, D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, back, 0);
+            }
             for (r, size, n, rb) in &uavs {
                 // (Buffers were promoted from the common state by the dispatch.)
                 list.ResourceBarrier(&[transition(
@@ -1509,7 +1625,20 @@ impl Host {
                 out.push(words);
             }
             drop(keep);
-            Ok(out)
+            let ns = if let Some((_, back)) = timing {
+                let mut p = std::ptr::null_mut();
+                back.Map(0, None, Some(&mut p)).map_err(err)?;
+                let [start, end] = *p.cast::<[u64; 2]>();
+                back.Unmap(0, Some(&D3D12_RANGE::default()));
+                if end <= start {
+                    return Err("timestamp batch did not advance".into());
+                }
+                (end - start) as f64 * 1e9 / queue.GetTimestampFrequency().map_err(err)? as f64
+                    / f64::from(passes)
+            } else {
+                0.0
+            };
+            Ok((out, ns))
         }
     }
 }

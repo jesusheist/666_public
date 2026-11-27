@@ -54,8 +54,7 @@ pub(crate) fn on() -> bool {
 
 /// Whether it is asked for.
 pub(crate) fn wanted() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_THIN").is_some_and(|v| v == "1"))
+    victory_core::tunables::known::THIN.get()
 }
 
 /// What a title list keeps: the recording being written and the words of it
@@ -300,7 +299,7 @@ fn back_list(kind: u32) -> This {
 }
 
 fn start() {
-    let threads = std::env::var("VICTORY_THIN_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8usize).clamp(1, 32);
+    let threads = victory_core::tunables::known::THIN_THREADS.get() as usize;
     for i in 0..threads {
         let worker = move || {
             crate::cores::keep_many_on_fast_cores("victory-list");

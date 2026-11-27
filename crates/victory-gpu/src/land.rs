@@ -43,7 +43,7 @@ const JOB: usize = 256 << 10;
 pub(crate) fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var_os("VICTORY_LAND").is_none_or(|v| v != "0") && crate::safecopy::on() && crate::shadow::exact_back()
+        victory_core::tunables::known::LAND.get() && crate::safecopy::on() && crate::shadow::exact_back()
     })
 }
 
@@ -51,22 +51,20 @@ pub(crate) fn on() -> bool {
 fn threads() -> usize {
     static THREADS: OnceLock<usize> = OnceLock::new();
     *THREADS.get_or_init(|| {
-        let asked = std::env::var("VICTORY_LAND_THREADS").ok().and_then(|v| v.trim().parse().ok());
+        let asked = Some(victory_core::tunables::known::LAND_THREADS.get() as usize).filter(|&n| n > 0);
         asked.unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| n.get() / 4).clamp(1, 4)).clamp(1, 16)
     })
 }
 
 /// Whether views of the title's pages are written through one of ours.
 fn beside_on() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_BESIDE").is_none_or(|v| v != "0"))
+    victory_core::tunables::known::LAND_BESIDE.get()
 }
 
 /// Whether pieces an earlier fetch holds as they are now are left out
 /// ([`Had`]; `VICTORY_LAND_SKIP=1`, off by default: counted either way).
 pub(crate) fn skip_on() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_SKIP").is_some_and(|v| v == "1"))
+    victory_core::tunables::known::LAND_SKIP.get()
 }
 
 /// Since the last frame-rate line; microseconds first.
@@ -333,7 +331,7 @@ pub(crate) fn each(count: usize, f: &(dyn Fn(usize) + Sync)) {
 pub(crate) fn each_under(count: usize, f: &(dyn Fn(usize) + Sync)) {
     static POOL: OnceLock<&'static Pool> = OnceLock::new();
     POOL.get_or_init(|| {
-        let threads = std::env::var("VICTORY_UNDER_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(6usize);
+        let threads = victory_core::tunables::known::UNDER_THREADS.get() as usize;
         Pool::new("victory-under", threads.clamp(1, 16))
     })
     .each(count, f);
@@ -471,8 +469,7 @@ impl Had {
 /// memory its shaders are writing at that moment, which it may not (its
 /// fences are signalled after the landing).
 fn anytime() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_ANYTIME").is_none_or(|v| v != "0"))
+    victory_core::tunables::known::LAND_ANYTIME.get()
 }
 
 /// What a job wrote beside the guards, to be noted ([`Notes::flush`]).
@@ -507,8 +504,7 @@ unsafe impl Send for Notes {}
 /// block's bit, `crate::watch::block_published`), and the landing put the
 /// same bytes into both. Only where one copy alone landed in the block.
 fn taken() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_TAKEN").is_none_or(|v| v != "0"))
+    victory_core::tunables::known::LAND_TAKEN.get()
 }
 
 /// Since the last frame-rate line: blocks landed in beside the guards, and

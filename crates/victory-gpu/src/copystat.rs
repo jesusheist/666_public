@@ -175,12 +175,8 @@ fn taken(i: usize) -> u64 {
 
 /// How copies run: 0 guarded (as always), 1 plain, 2 not at all.
 pub(crate) fn mode() -> u8 {
-    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("VICTORY_COPY_MODE").as_deref() {
-        Ok("plain") => 1,
-        Ok("none") => 2,
-        _ => 0,
-    })
+    // The list's order is the number: normal, plain, none.
+    victory_core::tunables::known::COPY_MODE.get() as u8
 }
 
 /// Per source range (start, length): copies, bytes, microseconds, memory type.
@@ -271,13 +267,8 @@ pub(crate) fn card_waited(us: u64, what: impl FnOnce() -> String) {
 /// bits for `both`. For timing only: without the waits a shader may read
 /// what another has not finished writing.
 pub(crate) fn barrier_test() -> u8 {
-    static TEST: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *TEST.get_or_init(|| match std::env::var("VICTORY_BARRIER_TEST").as_deref() {
-        Ok("groups") => 1,
-        Ok("indirect") => 2,
-        Ok("both") => 3,
-        _ => 0,
-    })
+    // The list's order is the number: off, groups, indirect, both.
+    victory_core::tunables::known::BARRIER_TEST.get() as u8
 }
 
 /// Per range compared after a submission (start, length): times, and the
