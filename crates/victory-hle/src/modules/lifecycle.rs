@@ -236,6 +236,9 @@ pub extern "system" fn CreateWindowExW(
         )
     };
     hook(hwnd);
+    if parent.is_null() {
+        set_icon(hwnd);
+    }
     hwnd
 }
 
@@ -262,7 +265,104 @@ pub extern "system" fn CreateWindowExA(
         )
     };
     hook(hwnd);
+    if parent.is_null() {
+        set_icon(hwnd);
+    }
     hwnd
+}
+
+/// Gives a top-level window of the title the port's icon, big for the taskbar
+/// and small for the title bar: the title's window class has none, and Windows
+/// would show its default. The icon file is built into the program
+/// (`assets/gtavi.ico`) and made in memory: inside a title run the resource
+/// functions find no icon group in our exe (seen in run logs), so no resource
+/// lookup is used.
+fn set_icon(hwnd: HWND) {
+    if hwnd.is_null() {
+        return;
+    }
+    let mut set = 0;
+    // SAFETY: plain calls on our own window with bytes that live for the program.
+    unsafe {
+        for (which, cx, cy) in [
+            (wm::ICON_BIG, wm::SM_CXICON, wm::SM_CYICON),
+            (wm::ICON_SMALL, wm::SM_CXSMICON, wm::SM_CYSMICON),
+        ] {
+            let (w, h) = (wm::GetSystemMetrics(cx), wm::GetSystemMetrics(cy));
+            let Some(bits) = icon_image(ICON_FILE, w.max(h) as u32) else {
+                tracing::warn!("window icon: no image in the built-in icon file");
+                return;
+            };
+            let icon = wm::CreateIconFromResourceEx(bits.as_ptr(), bits.len() as u32, 1, 0x0003_0000, w, h, wm::LR_DEFAULTCOLOR);
+            if !icon.is_null() {
+                // The class icon too: shown whenever the window's own is unset.
+                let slot = if which == wm::ICON_BIG { wm::GCLP_HICON } else { wm::GCLP_HICONSM };
+                wm::SetClassLongPtrW(hwnd, slot, icon as isize);
+                wm::SendMessageW(hwnd, wm::WM_SETICON, which as WPARAM, icon as LPARAM);
+                set += 1;
+            }
+        }
+        let now = wm::SendMessageW(hwnd, wm::WM_GETICON, wm::ICON_BIG as WPARAM, 0);
+        tracing::warn!(hwnd = hwnd as usize, set, now, "window icon applied");
+    }
+}
+
+/// The port's icon (the GTA VI logo, several sizes), as an .ico file.
+const ICON_FILE: &[u8] = include_bytes!("../../assets/gtavi.ico");
+
+/// The image of an .ico file closest to `size` pixels (the smallest one at
+/// least that big, else the biggest): its bytes, as `CreateIconFromResourceEx` takes them.
+fn icon_image(file: &[u8], size: u32) -> Option<&[u8]> {
+    let word = |at: usize| Some(u16::from_le_bytes(file.get(at..at + 2)?.try_into().ok()?));
+    let dword = |at: usize| Some(u32::from_le_bytes(file.get(at..at + 4)?.try_into().ok()?));
+    if word(0)? != 0 || word(2)? != 1 {
+        return None;
+    }
+    let mut best: Option<(u32, usize, usize)> = None;
+    for k in 0..usize::from(word(4)?) {
+        let entry = 6 + 16 * k;
+        let side = match *file.get(entry)? {
+            0 => 256,
+            n => u32::from(n),
+        };
+        let (len, at) = (dword(entry + 8)? as usize, dword(entry + 12)? as usize);
+        let better = match best {
+            None => true,
+            Some((b, _, _)) => (side >= size && (b < size || side < b)) || (b < size && side > b),
+        };
+        if better {
+            best = Some((side, at, len));
+        }
+    }
+    let (_, at, len) = best?;
+    file.get(at..at + len)
+}
+
+#[cfg(test)]
+#[test]
+fn the_built_in_icon_has_an_image_near_each_size() {
+    for size in [16, 24, 32, 48, 64, 256] {
+        let bits = icon_image(ICON_FILE, size).expect("an image");
+        assert!(bits.len() > 1000, "size {size}");
+    }
+    assert!(icon_image(&[0; 4], 32).is_none());
+}
+
+/// The title's top-level window still has no icon (it was made before ours
+/// could be set, or the title cleared it): sets it, at most a few times.
+fn icon_missing(hwnd: HWND) -> bool {
+    static TRIES: AtomicUsize = AtomicUsize::new(0);
+    if TRIES.load(Ordering::Relaxed) >= 8 {
+        return false;
+    }
+    // SAFETY: plain queries on a window of ours.
+    let missing = unsafe {
+        wm::GetParent(hwnd).is_null() && wm::SendMessageW(hwnd, wm::WM_GETICON, wm::ICON_BIG as WPARAM, 0) == 0
+    };
+    if missing {
+        TRIES.fetch_add(1, Ordering::Relaxed);
+    }
+    missing
 }
 
 /// A console title sizes its window to its render target (
@@ -453,6 +553,7 @@ extern "system" fn window_proc(
         // loop ends (a clip following a shrinking client area collapses it).
         wm::WM_ENTERSIZEMOVE => super::gameinput::cursor::size_move(true),
         wm::WM_EXITSIZEMOVE => super::gameinput::cursor::size_move(false),
+        wm::WM_SHOWWINDOW | wm::WM_ACTIVATE | wm::WM_ACTIVATEAPP | wm::WM_SIZE | wm::WM_PAINT if icon_missing(hwnd) => set_icon(hwnd),
         _ => {}
     }
     // SAFETY: the procedure `hook` stored, called the way the system would.
