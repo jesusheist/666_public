@@ -22,7 +22,7 @@ use victory_core::keybinds::{self as binds, Layout, Line};
 
 use super::Action;
 use super::Tab;
-use super::pages::{PLine, PView};
+use super::pages::{Curated, PLine, PView};
 use super::live;
 
 /// The lines after the actions.
@@ -33,6 +33,8 @@ const ACTION_LINES: [(&str, &str); 3] = [
 ];
 
 const SECTION: &str = "SECTION";
+/// What the section line shows on the options section (after the three layouts).
+const OPTIONS: &str = "OPTIONS";
 
 /// What the page waits for.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -52,11 +54,14 @@ pub(crate) struct Page {
     scroll: usize,
     note: String,
     capture: Option<Capture>,
+    /// The options section (after AIRCRAFT): the keyboard and mouse lines that are not key bindings.
+    /// Its lines are those of a [`Curated`] page; this page adds the section line over them.
+    options: Option<Curated>,
 }
 
 impl Default for Page {
     fn default() -> Page {
-        Page { layout: Layout::OnFoot, selected: 0, scroll: 0, note: String::new(), capture: None }
+        Page { layout: Layout::OnFoot, selected: 0, scroll: 0, note: String::new(), capture: None, options: None }
     }
 }
 
@@ -137,7 +142,14 @@ impl Page {
     }
 
     fn go_section(&mut self, dir: i32) {
-        self.layout = if dir > 0 { self.layout.next() } else { self.layout.prev() };
+        if self.options.take().is_some() {
+            self.layout = if dir > 0 { Layout::OnFoot } else { Layout::Aircraft };
+        } else if (dir > 0 && self.layout == Layout::Aircraft) || (dir < 0 && self.layout == Layout::OnFoot) {
+            self.layout = Layout::Aircraft;
+            self.options = Some(Curated::new(Tab::Controls));
+        } else {
+            self.layout = if dir > 0 { self.layout.next() } else { self.layout.prev() };
+        }
         self.selected = 0;
         self.scroll = 0;
         self.note.clear();
@@ -156,6 +168,9 @@ impl Page {
     pub(crate) fn step(&mut self, action: Action) -> bool {
         if self.capture.is_some() {
             return false;
+        }
+        if self.options.is_some() {
+            return self.step_options(action);
         }
         let lines = self.lines();
         let n = lines.len();
@@ -183,6 +198,42 @@ impl Page {
         close
     }
 
+    /// A key in the options section: row 0 is the section line, the others are the lines of the options page.
+    fn step_options(&mut self, action: Action) -> bool {
+        let total = 1 + self.options.as_ref().map_or(0, Curated::rows);
+        self.selected = self.selected.min(total - 1);
+        let mut close = false;
+        match (action, self.selected) {
+            (Action::Up, _) => self.selected = (self.selected + total - 1) % total,
+            (Action::Down, _) => self.selected = (self.selected + 1) % total,
+            (Action::Left, 0) => {
+                self.go_section(-1);
+                return false;
+            }
+            (Action::Right | Action::Enter, 0) => {
+                self.go_section(1);
+                return false;
+            }
+            (action, at) if at >= 1 => {
+                if let Some(page) = self.options.as_mut() {
+                    page.select(at - 1);
+                    if let Some(act) = page.step(action) {
+                        close = page.run(act);
+                    }
+                }
+            }
+            _ => {}
+        }
+        let at = self.selected;
+        if let Some(page) = self.options.as_mut() {
+            if at >= 1 {
+                page.select(at - 1);
+            }
+            self.scroll = live::follow(at, self.scroll, total);
+        }
+        close
+    }
+
     /// Page Up and Page Down.
     pub(crate) fn section(&mut self, dir: i32) {
         if self.capture.is_none() {
@@ -192,6 +243,13 @@ impl Page {
 
     /// The selected line back to its default keys.
     pub(crate) fn reset_selected(&mut self) {
+        if let Some(page) = self.options.as_mut() {
+            if self.selected >= 1 {
+                page.select(self.selected - 1);
+                page.reset_selected();
+            }
+            return;
+        }
         let lines = self.lines();
         if let Row::Line(i) = self.row(lines.len()) {
             binds::reset(self.layout, &lines[i].id);
@@ -201,6 +259,11 @@ impl Page {
 
     /// Every line of the section back to its default keys.
     pub(crate) fn reset_section(&mut self) {
+        if let Some(page) = self.options.as_ref() {
+            let n = page.reset_all();
+            self.note = if n == 0 { "Nothing was changed here".to_owned() } else { format!("{n} lines back to their defaults") };
+            return;
+        }
         let n = binds::reset_layout(self.layout);
         self.note = if n == 0 { "Nothing was changed here".to_owned() } else { format!("{n} lines back to their default keys") };
     }
@@ -239,6 +302,9 @@ impl Page {
 
     /// What to paint now; `fps` and `ms` are the frame rate and frame time.
     pub(crate) fn view(&self, fps: f32, ms: f32) -> PView {
+        if let Some(page) = &self.options {
+            return self.options_view(page, fps, ms);
+        }
         let lines = self.lines();
         let n = lines.len();
         let rows = self.rows(n);
@@ -299,6 +365,24 @@ impl Page {
         }
     }
 
+    /// The options section: the section line, then the options page's rows.
+    fn options_view(&self, page: &Curated, fps: f32, ms: f32) -> PView {
+        let mut inner = page.view(fps, ms);
+        let on_section = self.selected == 0;
+        let section = PLine { label: SECTION.to_owned(), value: OPTIONS.to_owned(), selected: on_section, ..PLine::default() };
+        let mut lines = vec![section];
+        for mut line in inner.lines.drain(..) {
+            line.selected &= !on_section;
+            lines.push(line);
+        }
+        let desc = if on_section {
+            "Left and Right (or Page Up and Page Down) switch between ON FOOT, VEHICLE, AIRCRAFT and OPTIONS. Options are saved with the lines at the bottom, not with the keys.".to_owned()
+        } else {
+            inner.desc
+        };
+        PView { tab: Tab::Controls, rows: 1 + inner.rows, scroll: 0, lines, desc, note: if self.note.is_empty() { inner.note } else { self.note.clone() }, env: String::new(), ..inner }
+    }
+
     fn desc(&self, lines: &[Line]) -> String {
         let n = lines.len();
         if let Some(cap) = &self.capture {
@@ -310,7 +394,7 @@ impl Page {
         match self.row(n) {
             Row::Section => {
                 let aircraft = if self.layout == Layout::Aircraft { " These keys are the vehicle keys when the controls file has vehicle_layout = \"aircraft\"." } else { "" };
-                format!("Left and Right (or Page Up and Page Down) switch between ON FOOT, VEHICLE and AIRCRAFT.{aircraft}")
+                format!("Left and Right (or Page Up and Page Down) switch between ON FOOT, VEHICLE, AIRCRAFT and OPTIONS.{aircraft}")
             }
             Row::Line(i) => {
                 let line = &lines[i];
@@ -420,7 +504,7 @@ pub(crate) fn test_setup() -> binds::Setup {
         ("Space", &["Jump"]),
         ("LCtrl", &["Crouch"]),
         ("C", &["Crouch"]),
-        ("F", &["EnterVehicle"]),
+        ("F", &["Interact"]),
         ("G", &["ToggleVehicle"]),
         ("R", &["Melee"]),
         ("Q", &["Cover"]),
@@ -435,7 +519,7 @@ pub(crate) fn test_setup() -> binds::Setup {
         ("Right", &["Objective"]),
         ("P", &["Pause"]),
     ]);
-    let vehicle = table(&[("W", &["Accelerate"]), ("S", &["Brake"]), ("Space", &["Handbrake"]), ("LShift", &[]), ("F", &["ExitVehicle"]), ("E", &["Horn"])]);
+    let vehicle = table(&[("W", &["Accelerate"]), ("S", &["Brake"]), ("Space", &["Handbrake"]), ("LShift", &[]), ("F", &["Interact"]), ("E", &["Horn"])]);
     let aircraft = table(&[("W", &["ThrottleUp"]), ("S", &["ThrottleDown"]), ("A", &["YawLeft"]), ("D", &["YawRight"]), ("G", &["Undercarriage"])]);
     let defs = |rows: &[(&str, &str, &str)]| rows.iter().map(|(id, label, pad)| Def::new(id, label, pad)).collect::<Vec<_>>();
     binds::Setup {
@@ -449,7 +533,7 @@ pub(crate) fn test_setup() -> binds::Setup {
                 ("Sprint", "Sprint", "LS click"),
                 ("Jump", "Jump", "A"),
                 ("Crouch", "Crouch / rest", "B"),
-                ("EnterVehicle", "Interact / enter vehicle", "Y and switches to the vehicle keys"),
+                ("Interact", "Interact / get in (doors, prompts)", "Y"),
                 ("ToggleVehicle", "Switch to vehicle keys", "no pad button, switches the key layout"),
                 ("Melee", "Melee", "X"),
                 ("Cover", "Cover / quick throw", "RB"),
@@ -468,7 +552,7 @@ pub(crate) fn test_setup() -> binds::Setup {
                 ("Brake", "Brake / reverse", "LT"),
                 ("Handbrake", "Handbrake", "A"),
                 ("Horn", "Horn", "LS click"),
-                ("ExitVehicle", "Enter / exit vehicle", "Y and switches to the on-foot keys"),
+                ("Interact", "Interact / get out (doors, prompts)", "Y"),
             ]),
             defs(&[
                 ("ThrottleUp", "Throttle up", "RT"),
@@ -560,6 +644,36 @@ mod tests {
         assert!(page.view(0.0, 0.0).desc.starts_with("Jump. Pad: A. Enter: press a new key."), "{}", page.view(0.0, 0.0).desc);
         select(&mut page, "Holster / loadout");
         assert_eq!(page.view(0.0, 0.0).lines.iter().find(|l| l.selected).unwrap().value, "TAB");
+        binds::clear();
+    }
+
+    #[test]
+    fn the_options_section_follows_aircraft_and_lists_the_mouse_and_vehicle_lines() {
+        let (_turn, mut page) = fresh();
+        page.section(-1);
+        assert!(page.options.is_some(), "Page Up from ON FOOT goes round to OPTIONS");
+        page.section(1);
+        assert!(page.options.is_none());
+        assert_eq!(page.layout, Layout::OnFoot);
+        page.section(1);
+        page.section(1);
+        assert_eq!(page.layout, Layout::Aircraft);
+        page.section(1);
+        let v = page.view(0.0, 0.0);
+        assert_eq!((v.lines[0].label.as_str(), v.lines[0].value.as_str()), ("SECTION", "OPTIONS"));
+        assert!(v.lines[0].selected);
+        let labels: Vec<&str> = v.lines.iter().map(|l| l.label.as_str()).collect();
+        for want in ["KEYBOARD AND MOUSE AS PAD", "AUTO VEHICLE KEYS", "KEY PROMPTS", "MOUSE SENSITIVITY", "INVERT MOUSE Y", "DRAG WINDOW BY ITS TITLE BAR", "SAVE FOR NEXT START"] {
+            assert!(labels.contains(&want), "{want}");
+        }
+        assert_eq!(v.rows, v.lines.len());
+        // Down puts the selection on the first option line; Right and Left on the section line go round.
+        page.step(Action::Down);
+        let v = page.view(0.0, 0.0);
+        assert!(!v.lines[0].selected && v.lines[1].selected);
+        page.step(Action::Up);
+        page.step(Action::Right);
+        assert_eq!((page.layout, page.options.is_none()), (Layout::OnFoot, true));
         binds::clear();
     }
 

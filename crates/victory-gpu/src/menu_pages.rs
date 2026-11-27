@@ -98,6 +98,22 @@ pub(crate) fn home_items() -> Vec<Item> {
     ]
 }
 
+/// The OPTIONS section of the Controls page: the keyboard and mouse setup that is not a key binding.
+pub(crate) fn input_items() -> Vec<Item> {
+    const SENSITIVITY: &[(&str, &str)] = &[("0", "CONTROLS FILE"), ("0.5", "0.5"), ("0.75", "0.75"), ("1", "1"), ("1.5", "1.5"), ("2", "2"), ("3", "3"), ("4", "4")];
+    const INVERT: &[(&str, &str)] = &[("file", "CONTROLS FILE"), ("off", "OFF"), ("on", "ON")];
+    const FLAG: &[(&str, &str)] = &[("off", "OFF"), ("img+74dfca5", "ON (GAME 1.0.2.1)")];
+    const PROMPTS: &[(&str, &str)] = &[("off", "GAME PAD PICTURES"), ("keys", "KEY CAPS")];
+    vec![
+        slot_item("KEYBOARD AND MOUSE AS PAD", k::KEYS_AS_PAD.slot(), OFF_ON),
+        slot_item("AUTO VEHICLE KEYS", k::VEHICLE_FLAG.slot(), FLAG),
+        slot_item("KEY PROMPTS", k::PROMPTS.slot(), PROMPTS),
+        slot_item("MOUSE SENSITIVITY", k::MOUSE_SENSITIVITY.slot(), SENSITIVITY),
+        slot_item("INVERT MOUSE Y", k::MOUSE_INVERT_Y.slot(), INVERT),
+        slot_item("DRAG WINDOW BY ITS TITLE BAR", k::DRAG_FIX.slot(), OFF_ON),
+    ]
+}
+
 /// The Graphics list: DLSS, the console and picture size, and the picture switches.
 pub(crate) fn graphics_items() -> Vec<Item> {
     vec![
@@ -296,12 +312,20 @@ impl Curated {
             Tab::Performance => (performance_items(), true),
             Tab::Overlay => (overlay_items(), false),
             Tab::Cheats => (cheats_items(), false),
-            Tab::Controls | Tab::Advanced => (Vec::new(), false),
+            // The options section of the Controls page (`menu_controls`) borrows this page's lines.
+            Tab::Controls => (input_items(), true),
+            Tab::Advanced => (Vec::new(), false),
         };
         Curated { tab, items, actions, selected: 0, scroll: 0, note: String::new() }
     }
 
-    fn rows(&self) -> usize {
+    /// Puts the selection on line `at` (the Controls page's options section drives this page's lines).
+    pub(crate) fn select(&mut self, at: usize) {
+        self.selected = at.min(self.rows().saturating_sub(1));
+    }
+
+    /// How many rows there are: the lines and the action lines.
+    pub(crate) fn rows(&self) -> usize {
         self.items.len() + if self.actions { ACTIONS.len() } else { 0 }
     }
 
@@ -807,6 +831,27 @@ mod tests {
         assert!(filled[3] > 0.9 && filled[0] > 0.6, "{filled:?}");
         // The list and the readout stay clear of the footer.
         assert!(bar_y + 4 < (live::HEADER + live::GAP + live::ROW * live::ROWS as f32) as usize);
+    }
+
+    #[test]
+    fn the_controls_options_lines_are_real_tunables_with_values_they_accept() {
+        let items = input_items();
+        let labels: Vec<&str> = items.iter().map(|i| i.label).collect();
+        assert_eq!(labels, ["KEYBOARD AND MOUSE AS PAD", "AUTO VEHICLE KEYS", "KEY PROMPTS", "MOUSE SENSITIVITY", "INVERT MOUSE Y", "DRAG WINDOW BY ITS TITLE BAR"]);
+        for item in &items {
+            let Src::Slot(slot) = item.src else { panic!("{} is not a tunable", item.label) };
+            assert!(!item.values.is_empty(), "{}", item.label);
+            for (text, _) in item.values {
+                match slot.meta().kind {
+                    RegKind::Choice(list) => assert!(list.iter().any(|c| c.eq_ignore_ascii_case(text)), "{}: {text}", item.label),
+                    RegKind::Float { min, max } => assert!((min..=max).contains(&text.parse::<f64>().unwrap()), "{}: {text}", item.label),
+                    RegKind::Bool => assert!(matches!(*text, "true" | "false"), "{}: {text}", item.label),
+                    _ => panic!("{}: unexpected kind", item.label),
+                }
+            }
+        }
+        let page = Curated::new(Tab::Controls);
+        assert_eq!(page.rows(), items.len() + 4);
     }
 
     #[test]

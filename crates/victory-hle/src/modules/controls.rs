@@ -1267,6 +1267,8 @@ pub(super) struct Controls {
     flag_state: Option<bool>,
     /// The CONTROLS page's change count the layouts were built from last.
     bindings_seen: u64,
+    /// The controls file's mouse sensitivity and inversion: what the menu's INPUT lines fall back to.
+    file_mouse: (f32, bool),
 }
 
 /// Where the title's flag lies.
@@ -1398,6 +1400,7 @@ fn read_flag(_: &VehicleFlag) -> Option<u64> {
 impl Controls {
     pub(super) fn new(s: Settings) -> Controls {
         LAYOUT_IS_VEHICLE.store(s.start_in_vehicle, Ordering::Relaxed);
+        let file_mouse = (s.sensitivity, s.invert_y);
         Controls {
             vehicle: s.start_in_vehicle,
             s,
@@ -1419,7 +1422,20 @@ impl Controls {
             flag: vehicle_flag(),
             flag_state: None,
             bindings_seen: 0,
+            file_mouse,
         }
+    }
+
+    /// The mouse the INPUT page of the menu sets over the controls file's: a sensitivity
+    /// above 0 replaces the file's, inversion `1` (off) or `2` (on) replaces the file's
+    /// (`0` keeps it). Changes apply at the next read.
+    fn follow_mouse(&mut self, sensitivity: f64, invert: usize) {
+        self.s.sensitivity = if sensitivity > 0.0 { sensitivity.clamp(0.01, 100.0) as f32 } else { self.file_mouse.0 };
+        self.s.invert_y = match invert {
+            1 => false,
+            2 => true,
+            _ => self.file_mouse.1,
+        };
     }
 
     /// Builds the layouts again from the tables of the CONTROLS page when it changed them
@@ -1548,6 +1564,10 @@ impl Controls {
     pub(super) fn feed(&mut self, held: &[u8], counts: &Counts) {
         let now = self.start.elapsed().as_millis() as u64;
         self.follow_flag(read_flag);
+        self.follow_mouse(
+            victory_core::tunables::known::MOUSE_SENSITIVITY.get(),
+            victory_core::tunables::known::MOUSE_INVERT_Y.get(),
+        );
         self.follow_bindings(victory_core::keybinds::generation(), victory_core::keybinds::live_tables);
         self.feed_at(held, counts, now);
     }
@@ -2500,6 +2520,21 @@ mod tests {
         at(&mut d, &["F"], 0);
         at(&mut d, &[], 50);
         assert!(!d.in_vehicle());
+    }
+
+    #[test]
+    fn the_menus_mouse_lines_go_over_the_controls_file() {
+        let mut c = Controls::new(Settings::with_options(&Options {
+            mouse_sensitivity: Some(2.5),
+            mouse_invert_y: Some(true),
+            ..Options::default()
+        }).unwrap());
+        c.follow_mouse(0.0, 0);
+        assert_eq!((c.s.sensitivity, c.s.invert_y), (2.5, true), "the file's values stand");
+        c.follow_mouse(4.0, 1);
+        assert_eq!((c.s.sensitivity, c.s.invert_y), (4.0, false));
+        c.follow_mouse(0.0, 2);
+        assert_eq!((c.s.sensitivity, c.s.invert_y), (2.5, true), "back to the file's sensitivity");
     }
 
     #[test]

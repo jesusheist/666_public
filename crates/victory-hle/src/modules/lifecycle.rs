@@ -534,6 +534,9 @@ extern "system" fn window_proc(
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_KEYMENU as usize {
         return 0;
     }
+    if drag::handle(hwnd, message, wparam) {
+        return 0;
+    }
     // The mouse cursor for keyboard and mouse play (`gameinput::cursor`):
     // hidden over the window while captured, captured by a click, freed when
     // the window loses focus. The title still sees every message.
@@ -564,6 +567,197 @@ extern "system" fn window_proc(
         }
         let title = std::mem::transmute::<*mut c_void, wm::WNDPROC>(title);
         wm::CallWindowProcW(title, hwnd, message, wparam, lparam)
+    }
+}
+
+/// Moving and sizing the window by its frame without the system's modal
+/// loop. A click on the title bar or a border makes `DefWindowProc` run a
+/// loop on the window's thread, which is the title's: the title gets no
+/// frames, input or audio pump until the button is released. Here the
+/// press starts a drag that is only state; the mouse messages that follow
+/// (the window holds the mouse capture) move or size the window one
+/// `SetWindowPos` at a time, and the title's own loop keeps running between
+/// them. `VICTORY_DRAG_FIX=0` leaves the system's loop in place.
+mod drag {
+    use std::sync::Mutex;
+
+    use windows_sys::Win32::Foundation::{HWND, POINT, RECT, WPARAM};
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetCapture, ReleaseCapture, SetCapture};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{self as wm};
+
+    /// A drag in progress: the window, the hit-test code that started it,
+    /// and where the cursor and the window were then.
+    #[derive(Clone, Copy)]
+    struct Drag {
+        hwnd: usize,
+        hit: u32,
+        cursor: POINT,
+        rect: RECT,
+    }
+
+    /// The left button flag in a mouse message's `wparam`.
+    const MK_LBUTTON: usize = 0x0001;
+
+    static ACTIVE: Mutex<Option<Drag>> = Mutex::new(None);
+
+    fn enabled() -> bool {
+        victory_gpu::tunables::known::DRAG_FIX.get()
+    }
+
+    fn active() -> std::sync::MutexGuard<'static, Option<Drag>> {
+        ACTIVE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn sizing(hit: u32) -> bool {
+        (wm::HTLEFT..=wm::HTBOTTOMRIGHT).contains(&hit)
+    }
+
+    /// The window's rectangle after the cursor moved by (`dx`, `dy`) in a
+    /// drag begun on `hit`; a size never goes below `min`.
+    pub(super) fn dragged_rect(hit: u32, start: &RECT, dx: i32, dy: i32, min: (i32, i32)) -> RECT {
+        let mut r = *start;
+        if hit == wm::HTCAPTION {
+            r.left += dx;
+            r.right += dx;
+            r.top += dy;
+            r.bottom += dy;
+            return r;
+        }
+        let left = matches!(hit, wm::HTLEFT | wm::HTTOPLEFT | wm::HTBOTTOMLEFT);
+        let right = matches!(hit, wm::HTRIGHT | wm::HTTOPRIGHT | wm::HTBOTTOMRIGHT);
+        let top = matches!(hit, wm::HTTOP | wm::HTTOPLEFT | wm::HTTOPRIGHT);
+        let bottom = matches!(hit, wm::HTBOTTOM | wm::HTBOTTOMLEFT | wm::HTBOTTOMRIGHT);
+        if left {
+            r.left = (start.left + dx).min(start.right - min.0);
+        }
+        if right {
+            r.right = (start.right + dx).max(start.left + min.0);
+        }
+        if top {
+            r.top = (start.top + dy).min(start.bottom - min.1);
+        }
+        if bottom {
+            r.bottom = (start.bottom + dy).max(start.top + min.1);
+        }
+        r
+    }
+
+    fn end(hwnd: HWND) {
+        *active() = None;
+        // SAFETY: gives back the capture this window took (a no-op without).
+        unsafe {
+            if GetCapture() == hwnd {
+                ReleaseCapture();
+            }
+        }
+    }
+
+    /// True when the message was ours and the title must not see it.
+    pub(super) fn handle(hwnd: HWND, message: u32, wparam: WPARAM) -> bool {
+        if !enabled() {
+            return false;
+        }
+        match message {
+            wm::WM_NCLBUTTONDOWN => {
+                let hit = wparam as u32;
+                if hit != wm::HTCAPTION && !sizing(hit) {
+                    return false;
+                }
+                let mut cursor = POINT { x: 0, y: 0 };
+                let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+                // SAFETY: plain queries and the capture for this window.
+                unsafe {
+                    // A maximized window is restored by the system's own
+                    // handling of the drag, and borders do nothing then.
+                    if wm::IsZoomed(hwnd) != 0
+                        || wm::GetCursorPos(&mut cursor) == 0
+                        || wm::GetWindowRect(hwnd, &mut rect) == 0
+                    {
+                        return false;
+                    }
+                    *active() = Some(Drag { hwnd: hwnd as usize, hit, cursor, rect });
+                    SetCapture(hwnd);
+                }
+                true
+            }
+            wm::WM_MOUSEMOVE => {
+                let Some(drag) = active().filter(|d| d.hwnd == hwnd as usize) else {
+                    return false;
+                };
+                if wparam & MK_LBUTTON == 0 {
+                    end(hwnd);
+                    return true;
+                }
+                let mut now = POINT { x: 0, y: 0 };
+                // SAFETY: a query, then one move or size of our window.
+                unsafe {
+                    if wm::GetCursorPos(&mut now) == 0 {
+                        return true;
+                    }
+                    let min = (
+                        wm::GetSystemMetrics(wm::SM_CXMINTRACK),
+                        wm::GetSystemMetrics(wm::SM_CYMINTRACK),
+                    );
+                    let r = dragged_rect(
+                        drag.hit,
+                        &drag.rect,
+                        now.x - drag.cursor.x,
+                        now.y - drag.cursor.y,
+                        min,
+                    );
+                    wm::SetWindowPos(
+                        hwnd,
+                        std::ptr::null_mut(),
+                        r.left,
+                        r.top,
+                        r.right - r.left,
+                        r.bottom - r.top,
+                        wm::SWP_NOZORDER | wm::SWP_NOACTIVATE,
+                    );
+                }
+                true
+            }
+            wm::WM_LBUTTONUP | wm::WM_CANCELMODE | wm::WM_CAPTURECHANGED => {
+                if active().is_some_and(|d| d.hwnd == hwnd as usize) {
+                    end(hwnd);
+                    return message != wm::WM_CAPTURECHANGED;
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        const START: RECT = RECT { left: 100, top: 100, right: 500, bottom: 400 };
+        const MIN: (i32, i32) = (136, 39);
+
+        #[test]
+        fn a_caption_drag_moves_without_sizing() {
+            let r = dragged_rect(wm::HTCAPTION, &START, 30, -20, MIN);
+            assert_eq!((r.left, r.top, r.right, r.bottom), (130, 80, 530, 380));
+        }
+
+        #[test]
+        fn borders_move_only_their_own_edges() {
+            let r = dragged_rect(wm::HTBOTTOMRIGHT, &START, 50, 60, MIN);
+            assert_eq!((r.left, r.top, r.right, r.bottom), (100, 100, 550, 460));
+            let r = dragged_rect(wm::HTTOPLEFT, &START, 10, 20, MIN);
+            assert_eq!((r.left, r.top, r.right, r.bottom), (110, 120, 500, 400));
+            let r = dragged_rect(wm::HTRIGHT, &START, -20, 99, MIN);
+            assert_eq!((r.left, r.top, r.right, r.bottom), (100, 100, 480, 400));
+        }
+
+        #[test]
+        fn a_size_never_goes_below_the_minimum_and_the_far_edge_stays() {
+            let r = dragged_rect(wm::HTLEFT, &START, 900, 0, MIN);
+            assert_eq!((r.left, r.right), (500 - 136, 500));
+            let r = dragged_rect(wm::HTBOTTOM, &START, 0, -900, MIN);
+            assert_eq!((r.top, r.bottom), (100, 100 + 39));
+        }
     }
 }
 
