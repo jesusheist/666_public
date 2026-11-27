@@ -15,6 +15,7 @@
 //! are not declared: the registry holds numbers, on/off and fixed choices.
 
 mod menu;
+mod overlay;
 mod switches_1;
 mod switches_2;
 mod switches_3;
@@ -24,6 +25,8 @@ mod switches_6;
 
 #[allow(unused_imports)]
 pub use menu::*;
+#[allow(unused_imports)]
+pub use overlay::*;
 #[allow(unused_imports)]
 pub use switches_1::*;
 #[allow(unused_imports)]
@@ -40,6 +43,7 @@ pub use switches_6::*;
 /// Registers every area's tunables.
 pub fn register_all() {
     menu::register();
+    overlay::register();
     switches_1::register();
     switches_2::register();
     switches_3::register();

@@ -1,59 +1,73 @@
-//! The run's numbers on the picture, in every build (`VICTORY_PANEL=1`; off
-//! by default; F3 or the settings menu shows and hides it while our window
-//! has the focus; the time spent recording is counted in diagnostics builds
-//! only): white
-//! text on a black box in the upper left corner of what is shown, so that a
-//! screenshot carries them, with what it costs itself on the submitting
-//! thread. Made again twice a second from the counters of
-//! the frame-rate line, memory and textures; a frame itself only copies the
-//! box out of a buffer in the card's memory. Copied onto the swap chain's
-//! buffer, behind the title's picture: saved frames and the frame recorder
-//! see the title's own.
+//! The run's numbers on the picture, in every build (`VICTORY_STATS_PANEL=1`
+//! or the older `VICTORY_PANEL=1`; off by default; F2 shows and hides
+//! it while our window has the focus; the time spent recording is counted in
+//! diagnostics builds only). It looks like the in-game menu (F10): a rounded
+//! panel of frosted glass (the card blurs the picture under it, see `menu.rs`), a
+//! banner with the title "666" at the left and the frame rate (big) and frame
+//! time (small) at the right, and a thin accent bar under the banner that fills
+//! as the frame gets slower
+//! (full at 33.3 ms). With all the lines, grouped rows follow: FRAME, CPU / GPU
+//! and MEMORY (with a bar for the video memory in use), labels dim at the left of
+//! each column and values bold at its right, and a small footer with what the
+//! panel costs itself on the submitting thread. With the frame rate only, the
+//! box is the banner and its bar, nothing else.
+//!
+//! The numbers are read twice a second from the counters of the frame-rate
+//! line, memory and textures. The picture is painted on the CPU only when they
+//! (or the corner, size or lines) change, into a texture that the menu's own
+//! blitter draws onto the swap chain's buffer, behind the title's picture:
+//! saved frames and the frame recorder see the title's own.
+//!
+//! Its look is the "Overlay" page of the in-game menu (F10): the corner
+//! (`VICTORY_STATS_PANEL_CORNER`), the size (`VICTORY_STATS_PANEL_SIZE`: small,
+//! normal or large, 0.8, 1 and 1.3 times the window's scale) and the lines shown
+//! (`VICTORY_STATS_PANEL_LINES`: all the numbers, or the frame rate and frame
+//! time only).
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_F3};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_F2};
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
-use super::font::{colours, glyph};
-use super::{Host, HostList, transition};
+use super::{Host, HostList};
+use crate::menu::{self, Canvas, Mode, TEXT, TEXT_DIM, Text, WHITE, band, bar, rounded};
 
 /// How often the numbers change.
 const EVERY: Duration = Duration::from_millis(500);
 
-/// A character's dots, and with the space beside and below it.
-const GLYPH: (u32, u32) = (5, 7);
-const CELL: (u32, u32) = (6, 9);
-/// Characters in a line, lines, and the box's rim in dots.
-const COLUMNS: u32 = 40;
-const LINES: u32 = 10;
-const RIM: u32 = 3;
 
-/// The texts are put into one of these in turn: the card reads the others,
-/// at most half a second old.
-const UPLOADS: usize = 4;
-
+/// Whether it is asked for at the start: the tunable `VICTORY_STATS_PANEL`
+/// (environment, live settings file or the Live settings page), or the older
+/// switch `VICTORY_PANEL`.
 fn asked() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| crate::switch::on("VICTORY_PANEL"))
+    crate::tunables::known::PANEL.get() || crate::switch::on("VICTORY_PANEL")
 }
 
-/// Whether it is shown now.
+/// Whether it is shown now. F2 flips it for this run; a change of the
+/// tunable (the menu's Overlay page, the Live page) sets it.
 pub(super) fn shown() -> &'static AtomicBool {
     static SHOWN: OnceLock<AtomicBool> = OnceLock::new();
-    SHOWN.get_or_init(|| AtomicBool::new(asked()))
+    SHOWN.get_or_init(|| {
+        crate::tunables::known::PANEL.on_change(|on| shown().store(on, Ordering::Relaxed));
+        AtomicBool::new(asked())
+    })
 }
 
-/// F3 was pressed since the last call, with one of our windows in front.
+/// F2 was pressed since the last call, with one of our windows in front.
 fn pressed() -> bool {
     static DOWN: AtomicBool = AtomicBool::new(false);
     // SAFETY: a plain query.
-    let down = unsafe { GetAsyncKeyState(i32::from(VK_F3)) } < 0;
-    if DOWN.swap(down, Ordering::Relaxed) || !down {
+    let down = unsafe { GetAsyncKeyState(i32::from(VK_F2)) } < 0;
+    let edge = down && !DOWN.swap(down, Ordering::Relaxed);
+    if !down {
+        DOWN.store(false, Ordering::Relaxed);
+    }
+    if !edge {
         return false;
     }
     let mut process = 0;
@@ -62,50 +76,262 @@ fn pressed() -> bool {
     process == std::process::id()
 }
 
-/// The box's size in pixels, a dot being `scale` of them each way.
-const fn size(scale: u32) -> (u32, u32) {
-    ((COLUMNS * CELL.0 + 2 * RIM) * scale, (LINES * CELL.1 + 2 * RIM) * scale)
+
+
+// ---------------------------------------------------------------------------
+// What is shown.
+
+/// The numbers of the last half second, as the painter lays them out.
+#[derive(Clone, Copy, Default, PartialEq, Debug)]
+pub(super) struct Values {
+    pub fps: f64,
+    /// A frame's time, ms.
+    pub ms: f64,
+    /// The longest frame's, ms.
+    pub longest: f64,
+    pub draws: f64,
+    pub dropped: f64,
+    /// Per frame, ms.
+    pub submit_busy: f64,
+    pub waits_gpu: f64,
+    pub gpu_busy: f64,
+    pub idle_behind: f64,
+    pub copy_back: f64,
+    /// Time spent recording, ms a frame (diagnostics builds).
+    pub recording: f64,
+    /// Per frame, MB.
+    pub mb_up: f64,
+    pub textures: f64,
+    pub back: f64,
+    /// Bytes.
+    pub ram: u64,
+    pub in_memory: u64,
+    pub vram_used: u64,
+    pub vram_budget: u64,
+    pub shared: u64,
+    /// What the panel takes of a frame, in microseconds.
+    pub cost_us: f64,
 }
 
-/// Pixels to a dot for a picture that high: a 720-line screenshot of it
-/// shows one and a third.
-fn scale(height: u32) -> u32 {
-    (height / 540).max(1)
+/// Which lines are shown.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Lines {
+    Full,
+    Fps,
 }
 
-/// Whether a dot of the picture of `lines` is white.
-fn lit(lines: &[String], x: u32, y: u32) -> bool {
-    let (Some(x), Some(y)) = (x.checked_sub(RIM), y.checked_sub(RIM)) else {
-        return false;
-    };
-    if x % CELL.0 >= GLYPH.0 || y % CELL.1 >= GLYPH.1 || x / CELL.0 >= COLUMNS {
-        return false;
+impl Lines {
+    fn of(text: &str) -> Lines {
+        if text == "fps" { Lines::Fps } else { Lines::Full }
     }
-    let Some(&c) = lines.get((y / CELL.1) as usize).and_then(|l| l.as_bytes().get((x / CELL.0) as usize)) else {
-        return false;
-    };
-    (glyph(c.to_ascii_uppercase())[(y % CELL.1) as usize] >> (GLYPH.0 - 1 - x % CELL.0)) & 1 != 0
 }
 
-/// The box as rows of `pitch` bytes.
-fn painted(lines: &[String], scale: u32, colours: [&[u8]; 2], pitch: usize) -> Vec<u8> {
-    let (width, height) = size(scale);
-    let bytes = colours[0].len();
-    let mut out = vec![0; pitch * height as usize];
-    for y in 0..height / scale {
-        let top = pitch * (y * scale) as usize;
-        for x in 0..width / scale {
-            let colour = colours[usize::from(lit(lines, x, y))];
-            for i in 0..scale {
-                let at = top + (x * scale + i) as usize * bytes;
-                out[at..at + bytes].copy_from_slice(colour);
-            }
-        }
-        for i in 1..scale as usize {
-            out.copy_within(top..top + pitch, top + i * pitch);
-        }
+// Sizes at scale 1, in pixels.
+const FULL_W: f32 = 320.0;
+const FPS_W: f32 = 236.0;
+const PAD: f32 = 14.0;
+const RIM: f32 = 2.0;
+const BANNER: f32 = 34.0;
+const BAR_GAP: f32 = 5.0;
+const BAR_H: f32 = 4.0;
+const AFTER_BAR: f32 = 7.0;
+const HEAD: f32 = 18.0;
+const ROW: f32 = 18.0;
+const GROUP_GAP: f32 = 6.0;
+const VRAM_ROW: f32 = 30.0;
+const FOOT: f32 = 16.0;
+const BOTTOM: f32 = 8.0;
+const COL_GAP: f32 = 14.0;
+/// The margin to the picture's edge.
+const MARGIN: f32 = 14.0;
+/// A frame time that fills the thin bar, ms.
+const SLOW_MS: f64 = 1000.0 / 30.0;
+
+/// Items in the groups (the recording time only in diagnostics builds).
+const FRAME_N: usize = 3;
+const CPU_N: usize = if cfg!(feature = "diagnostics") { 6 } else { 5 };
+const MEMORY_N: usize = 6;
+
+/// Where the banner ends and the groups begin, at scale 1.
+const TOP: f32 = RIM + BANNER + BAR_GAP + BAR_H + AFTER_BAR;
+
+/// Rows of two columns for `n` items.
+const fn rows_of(n: usize) -> f32 {
+    n.div_ceil(2) as f32
+}
+
+/// A group's height at scale 1.
+const fn group_h(n: usize, extra: f32) -> f32 {
+    HEAD + extra + rows_of(n) * ROW + GROUP_GAP
+}
+
+/// The box's size at scale 1.
+fn unit(lines: Lines) -> (f32, f32) {
+    match lines {
+        Lines::Fps => (FPS_W, TOP),
+        Lines::Full => (
+            FULL_W,
+            TOP + group_h(FRAME_N, 0.0) + group_h(CPU_N, 0.0) + group_h(MEMORY_N, VRAM_ROW) + FOOT + BOTTOM,
+        ),
     }
-    out
+}
+
+/// The box's size in pixels at `scale`: exactly what [`paint`] draws.
+fn size(lines: Lines, scale: f32) -> (u32, u32) {
+    let (w, h) = unit(lines);
+    ((w * scale).round().max(1.0) as u32, (h * scale).round().max(1.0) as u32)
+}
+
+/// The corner as (right, bottom) from the tunable's text.
+fn corner_of(text: &str) -> (bool, bool) {
+    match text {
+        "top-right" => (true, false),
+        "bottom-left" => (false, true),
+        "bottom-right" => (true, true),
+        _ => (false, false),
+    }
+}
+
+/// Where the box's top left goes so that it sits in `corner` of the picture,
+/// `margin` pixels from its edges (never outside it).
+fn place(corner: (bool, bool), (width, height): (u32, u32), (w, h): (u32, u32), margin: u32) -> (u32, u32) {
+    let x = if corner.0 { width.saturating_sub(w + margin) } else { margin.min(width.saturating_sub(w)) };
+    let y = if corner.1 { height.saturating_sub(h + margin) } else { margin.min(height.saturating_sub(h)) };
+    (x, y)
+}
+
+/// The scale of the box: the window's scale (as the menu's: the full box is the
+/// unit, so the box follows the window) times the size setting's factor, kept
+/// within the picture.
+fn scale(picture: (u32, u32), client: Option<(u32, u32)>, text_size: &str, lines: Lines) -> f32 {
+    let (uw, uh) = unit(Lines::Full);
+    let window = menu::scale_for_view(picture, client, (uw, uh));
+    let factor = match text_size {
+        "small" => 0.8,
+        "large" => 1.3,
+        _ => 1.0,
+    };
+    let (w, h) = unit(lines);
+    let fit = (picture.0 as f32 / w).min(picture.1 as f32 / h);
+    (window * factor).min(fit).max(0.25)
+}
+
+/// "74 FPS" and "13.5 ms".
+fn fps_text(v: &Values) -> String {
+    format!("{:.0} FPS", v.fps)
+}
+
+fn ms_text(v: &Values) -> String {
+    format!("{:.1} ms", v.ms)
+}
+
+fn gb(bytes: u64) -> String {
+    format!("{:.1} GB", bytes as f64 / (1u64 << 30) as f64)
+}
+
+fn ms(v: f64) -> String {
+    format!("{v:.1} ms")
+}
+
+fn mb(v: f64) -> String {
+    format!("{v:.0} MB")
+}
+
+/// The groups: a name and its labels with values.
+fn groups(v: &Values) -> [(&'static str, Vec<(&'static str, String)>); 3] {
+    let mut cpu = vec![
+        ("SUBMIT BUSY", ms(v.submit_busy)),
+        ("WAITS FOR GPU", ms(v.waits_gpu)),
+        ("GPU BUSY", ms(v.gpu_busy)),
+        ("IDLE BEHIND US", ms(v.idle_behind)),
+        ("COPY BACK", ms(v.copy_back)),
+    ];
+    if cfg!(feature = "diagnostics") {
+        cpu.push(("RECORDING", ms(v.recording)));
+    }
+    [
+        (
+            "FRAME",
+            vec![("LONGEST", ms(v.longest)), ("DRAWS", format!("{:.0}", v.draws)), ("DROPPED", format!("{:.0}", v.dropped))],
+        ),
+        ("CPU / GPU", cpu),
+        (
+            "MEMORY",
+            vec![
+                ("RAM", gb(v.ram)),
+                ("IN MEMORY", gb(v.in_memory)),
+                ("SHARED", gb(v.shared)),
+                ("MB UP", mb(v.mb_up)),
+                ("TEXTURES", mb(v.textures)),
+                ("BACK", mb(v.back)),
+            ],
+        ),
+    ]
+}
+
+/// Where the banner's texts go, in pixels of the box: the title's right edge, and the
+/// frame rate's and frame time's left edges.
+fn banner_layout(text: &mut Text, v: &Values, scale: f32, width: f32) -> (f32, f32, f32) {
+    let px = |s: f32| (s * scale).round().max(1.0) as i32;
+    let title_right = (PAD + 2.0) * scale + text.measure("666", px(22.0), true).0 as f32;
+    let ms_w = text.measure(&ms_text(v), px(12.0), true).0 as f32;
+    let fps_w = text.measure(&fps_text(v), px(22.0), true).0 as f32;
+    let ms_left = width - PAD * scale - ms_w;
+    (title_right, ms_left - 8.0 * scale - fps_w, ms_left)
+}
+
+/// Paints the box of `lines` at `scale`.
+fn paint(text: &mut Text, v: &Values, lines: Lines, scale: f32) -> Canvas {
+    let (pw, ph) = size(lines, scale);
+    let mut c = Canvas::new(pw as usize, ph as usize);
+    let u = |x: f32| x * scale;
+    let px = |x: f32| (x * scale).round().max(1.0) as i32;
+    let w = pw as f32;
+
+    // Glass: the card blurs the picture under the box; this is the rim, the thin tint and the highlights.
+    menu::paint_glass(&mut c, scale, 12.0);
+
+    // Banner: a lighter band of the glass, the title, the frame rate and the frame time.
+    band(&mut c, u(RIM), u(RIM + BANNER), |_, t| (WHITE, 0.03 + 0.03 * t));
+    text.draw_shadowed(&mut c, "666", u(PAD + 2.0), u(RIM + 3.0), px(22.0), true, WHITE, false);
+    let (_, fps_left, ms_left) = banner_layout(text, v, scale, w);
+    text.draw(&mut c, &fps_text(v), fps_left, u(RIM + 3.0), px(22.0), true, WHITE, 1.0, false);
+    text.draw(&mut c, &ms_text(v), ms_left, u(RIM + 11.0), px(12.0), true, menu::TEXT_SOFT, 1.0, false);
+
+    // Frame time against 33.3 ms: full is slow.
+    let slow = (v.ms / SLOW_MS).clamp(0.0, 1.0) as f32;
+    bar(&mut c, (u(PAD), u(RIM + BANNER + BAR_GAP), w - u(2.0 * PAD), u(BAR_H)), slow);
+    if lines == Lines::Fps {
+        return c;
+    }
+
+    // Groups.
+    let col_w = (w - u(2.0 * PAD + COL_GAP)) / 2.0;
+    let mut y = u(TOP);
+    for (name, items) in groups(v) {
+        let name_w = text.measure(name, px(10.0), true).0 as f32;
+        text.draw(&mut c, name, u(PAD), y + u(2.0), px(10.0), true, TEXT_DIM, 1.0, false);
+        rounded(&mut c, (u(PAD) + name_w + u(8.0), y + u(8.0), w - u(2.0 * PAD) - name_w - u(8.0), u(1.0).max(1.0)), 0.0, Mode::Over, |_, _| (WHITE, 0.10));
+        y += u(HEAD);
+        if name == "MEMORY" {
+            let used = v.vram_used as f32 / v.vram_budget.max(1) as f32;
+            text.draw(&mut c, "VRAM", u(PAD), y, px(11.0), false, TEXT_DIM, 1.0, false);
+            let value = format!("{} / {}", gb(v.vram_used), gb(v.vram_budget));
+            text.draw(&mut c, &value, w - u(PAD), y - u(1.0), px(12.0), true, TEXT, 1.0, true);
+            bar(&mut c, (u(PAD), y + u(17.0), w - u(2.0 * PAD), u(6.0)), used);
+            y += u(VRAM_ROW);
+        }
+        for (i, (label, value)) in items.iter().enumerate() {
+            let x0 = u(PAD) + (i % 2) as f32 * (col_w + u(COL_GAP));
+            let ry = y + (i / 2) as f32 * u(ROW);
+            text.draw(&mut c, label, x0, ry, px(11.0), false, TEXT_DIM, 1.0, false);
+            text.draw(&mut c, value, x0 + col_w, ry - u(1.0), px(12.0), true, TEXT, 1.0, true);
+        }
+        y += rows_of(items.len()) * u(ROW) + u(GROUP_GAP);
+    }
+    let foot = format!("overlay {:.0} us a frame  |  F2 hides", v.cost_us);
+    text.draw(&mut c, &foot, u(PAD), y, px(10.0), false, TEXT_DIM, 0.8, false);
+    c
 }
 
 /// The counters read for it. They grow, and go back to 0 with the frame-rate
@@ -163,94 +389,44 @@ fn process_memory() -> (u64, u64) {
     (c.WorkingSetSize as u64, c.PagefileUsage as u64)
 }
 
-/// The frame generation line: `per` frames shown for each one rendered.
-fn generated(fps: f64, per: u32) -> String {
-    match per {
-        0 | 1 => "FRAME GEN OFF".to_owned(),
-        per => format!("FRAME GEN {per}X  SHOWN {:.1} FPS", fps * f64::from(per)),
-    }
-}
 
-/// The text. `c`: [`Counters`] per frame, `ms` a frame's time, `worst` the
+/// The numbers. `c`: [`Counters`] per frame, `ms` a frame's time, `worst` the
 /// longest frame's, `cost` what this takes of a frame, in microseconds.
-fn text(c: &[f64; COUNTERS], ms: f64, worst: f64, cost: f64, host: &Host) -> Vec<String> {
-    let gb = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
+fn values(c: &[f64; COUNTERS], ms: f64, worst: f64, cost: f64, host: &Host) -> Values {
     let (working, private) = process_memory();
     let [budget, used, _, shared] = host.video_memory().unwrap_or_default();
     let idle = (c[1] / 1e3).min(ms);
-    let fps = 1e3 / ms.max(0.001);
-    vec![
-        format!("FPS {fps:.1}  FRAME {ms:.1} MS  LONGEST {worst:.0}"),
-        generated(fps, crate::streamline::shown_per_frame()),
-        format!("DRAWS {:.0}  DROPPED {:.0}", c[10], c[8]),
-        format!("SUBMIT BUSY {:.1}  WAITS FOR GPU {:.1}", c[0] / 1e3, c[3] / 1e3),
-        format!("GPU BUSY {:.1}  IDLE BEHIND US {:.1}", ms - idle, c[2] / 1e3),
-        if cfg!(feature = "diagnostics") {
-            format!("RECORDING {:.0} MS  COPY BACK {:.1}", c[9] / 1e6, c[5] / 1e3)
-        } else {
-            format!("COPY BACK {:.1} MS", c[5] / 1e3)
-        },
-        format!("MB UP {:.0}  TEXTURES {:.0}  BACK {:.0}", c[7] / 1e6, c[4] / 1e6, c[6] / 1e6),
-        format!("RAM {:.1} GB  IN MEMORY {:.1}", gb(private), gb(working)),
-        format!("VRAM {:.1}/{:.1} GB  SHARED {:.1}", gb(used), gb(budget), gb(shared)),
-        format!("THIS PANEL {:.0} US A FRAME", cost),
-    ]
+    Values {
+        fps: 1e3 / ms.max(0.001),
+        ms,
+        longest: worst,
+        draws: c[10],
+        dropped: c[8],
+        submit_busy: c[0] / 1e3,
+        waits_gpu: c[3] / 1e3,
+        gpu_busy: ms - idle,
+        idle_behind: c[2] / 1e3,
+        copy_back: c[5] / 1e3,
+        recording: c[9] / 1e6,
+        mb_up: c[7] / 1e6,
+        textures: c[4] / 1e6,
+        back: c[6] / 1e6,
+        ram: private,
+        in_memory: working,
+        vram_used: used,
+        vram_budget: budget,
+        shared,
+        cost_us: cost,
+    }
 }
 
-/// The buffers of a box that size and format.
-struct Buffers {
-    format: DXGI_FORMAT,
+/// What the picture on the card was painted from.
+#[derive(PartialEq)]
+struct Painted {
+    values: Values,
+    lines: Lines,
     scale: u32,
-    pitch: u32,
-    uploads: Vec<(ID3D12Resource, *mut u8)>,
-    card: ID3D12Resource,
-    /// The upload written last.
-    turn: usize,
-    /// It is not in the card's buffer yet.
-    fresh: bool,
-}
-
-// SAFETY: free-threaded resources, and memory only written under the presenter's lock.
-unsafe impl Send for Buffers {}
-
-impl Buffers {
-    fn new(host: &Host, format: DXGI_FORMAT, scale: u32) -> Option<Buffers> {
-        let (width, height) = size(scale);
-        let pitch = (width * colours(format)?[0].len() as u32).next_multiple_of(256);
-        let bytes = u64::from(pitch) * u64::from(height);
-        let uploads = (0..UPLOADS).map(|_| host.upload_buffer(bytes)).collect::<Option<Vec<_>>>()?;
-        let heap = D3D12_HEAP_PROPERTIES {
-            Type: D3D12_HEAP_TYPE_DEFAULT,
-            ..Default::default()
-        };
-        let desc = D3D12_RESOURCE_DESC {
-            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-            Width: bytes,
-            Height: 1,
-            DepthOrArraySize: 1,
-            MipLevels: 1,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-            ..Default::default()
-        };
-        let mut card: Option<ID3D12Resource> = None;
-        // SAFETY: plain creation of a buffer.
-        unsafe {
-            host.device
-                .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut card)
-                .ok()?;
-        }
-        Some(Buffers { format, scale, pitch, uploads, card: card?, turn: 0, fresh: false })
-    }
-
-    fn write(&mut self, lines: &[String]) {
-        let Some(colours) = colours(self.format) else { return };
-        let picture = painted(lines, self.scale, colours, self.pitch as usize);
-        self.turn = (self.turn + 1) % UPLOADS;
-        // SAFETY: a mapped upload buffer of the picture's size, which the card read a second or more ago.
-        unsafe { std::ptr::copy_nonoverlapping(picture.as_ptr(), self.uploads[self.turn].1, picture.len()) };
-        self.fresh = true;
-    }
+    size: (u32, u32),
 }
 
 /// The panel of a presenter.
@@ -259,12 +435,13 @@ pub(super) struct Panel {
     frames: u32,
     last: Instant,
     worst: f64,
-    /// What this took since the last text.
+    /// What this took since the last numbers.
     cost: Duration,
     before: Counters,
-    lines: Vec<String>,
-    changed: bool,
-    buffers: Option<Buffers>,
+    values: Option<Values>,
+    painted: Option<Painted>,
+    overlay: Option<menu::Overlay>,
+    text: Option<Text>,
     failed: bool,
 }
 
@@ -278,9 +455,10 @@ impl Panel {
             worst: 0.0,
             cost: Duration::ZERO,
             before: Counters::default(),
-            lines: Vec::new(),
-            changed: false,
-            buffers: None,
+            values: None,
+            painted: None,
+            overlay: None,
+            text: None,
             failed: false,
         }
     }
@@ -314,14 +492,13 @@ impl Panel {
         let c = counters.since(self.before, frames);
         self.before = counters;
         let cost = self.cost.as_secs_f64() * 1e6 / frames;
-        self.lines = text(&c, elapsed.as_secs_f64() * 1e3 / frames, self.worst, cost, host);
-        self.changed = true;
+        self.values = Some(values(&c, elapsed.as_secs_f64() * 1e3 / frames, self.worst, cost, host));
         (self.since, self.frames, self.worst) = (now, 0, 0.0);
         self.cost = now.elapsed();
     }
 
-    /// Records the copy of the box onto `back`, a buffer of the swap chain of
-    /// that size and format in the state to be copied into.
+    /// Records the draw of the box onto `back`, a buffer of the swap chain of
+    /// that size and format in the state to be copied into (and left in it).
     pub(super) fn draw(
         &mut self,
         host: &Host,
@@ -329,68 +506,50 @@ impl Panel {
         back: &ID3D12Resource,
         (width, height): (u32, u32),
         format: DXGI_FORMAT,
+        hwnd: HWND,
     ) {
-        if !shown().load(Ordering::Relaxed) || self.lines.is_empty() || self.failed {
+        let Some(values) = self.values else { return };
+        if !shown().load(Ordering::Relaxed) || self.failed {
             return;
         }
         let began = Instant::now();
         // Not the title's: the frame recorder leaves it out.
         #[cfg(feature = "diagnostics")]
         let _ours = crate::replay::record::unrecorded();
-        let scale = scale(height);
-        if self.buffers.as_ref().is_none_or(|b| (b.format, b.scale) != (format, scale)) {
-            // (What the card may still read stays: a picture's size changes once or twice in a run.)
-            std::mem::forget(self.buffers.take());
-            self.buffers = Buffers::new(host, format, scale);
-            self.failed = self.buffers.is_none();
-            self.changed = true;
-        }
-        let Some(buffers) = &mut self.buffers else { return };
-        if std::mem::take(&mut self.changed) {
-            buffers.write(&self.lines);
-        }
-        let (w, h) = size(scale);
-        let list = &list.list;
-        // SAFETY: an open list and live resources; the box lies within both.
-        unsafe {
-            if std::mem::take(&mut buffers.fresh) {
-                list.CopyResource(&buffers.card, &buffers.uploads[buffers.turn].0);
-                list.ResourceBarrier(&[transition(
-                    &buffers.card,
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_COPY_SOURCE,
-                )]);
+        use crate::tunables::known::{STATS_PANEL_CORNER, STATS_PANEL_LINES, STATS_PANEL_SIZE};
+        let lines = Lines::of(STATS_PANEL_LINES.get_str());
+        let scale = scale((width, height), menu::client_size(hwnd), STATS_PANEL_SIZE.get_str(), lines);
+        let size = size(lines, scale);
+        if self.overlay.as_ref().is_none_or(|o| !o.matches(format, size)) {
+            match menu::Overlay::new(host, format, size) {
+                Ok(o) => {
+                    if let Some(old) = self.overlay.replace(o) {
+                        super::retire(old);
+                    }
+                    self.painted = None;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "the stats panel is not drawn: its pipeline was not made");
+                    self.failed = true;
+                    return;
+                }
             }
-            let from = D3D12_TEXTURE_COPY_LOCATION {
-                pResource: std::mem::transmute_copy(&buffers.card),
-                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
-                        Offset: 0,
-                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
-                            Format: format,
-                            Width: w,
-                            Height: h,
-                            Depth: 1,
-                            RowPitch: buffers.pitch,
-                        },
-                    },
-                },
-            };
-            let to = D3D12_TEXTURE_COPY_LOCATION {
-                pResource: std::mem::transmute_copy(back),
-                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
-            };
-            let part = D3D12_BOX {
-                left: 0,
-                top: 0,
-                front: 0,
-                right: w.min(width),
-                bottom: h.min(height),
-                back: 1,
-            };
-            list.CopyTextureRegion(&to, 0, 0, 0, &from, Some(&part));
+        }
+        if self.text.is_none() {
+            self.text = Text::new();
+        }
+        let want = Painted { values, lines, scale: scale.to_bits(), size };
+        if self.painted.as_ref() != Some(&want) {
+            if let (Some(text), Some(overlay)) = (self.text.as_mut(), self.overlay.as_mut()) {
+                overlay.write(&paint(text, &values, lines, scale).rgba8());
+                self.painted = Some(want);
+            }
+        }
+        let margin = (MARGIN * scale).round() as u32;
+        let (x, y) = place(corner_of(STATS_PANEL_CORNER.get_str()), (width, height), size, margin);
+        if let Some(overlay) = self.overlay.as_mut() {
+            overlay.look(12.0 * scale, 24.0 * scale);
+            overlay.record(host, &list.list, back, (width, height), (x as f32, y as f32), 1.0);
         }
         self.cost += began.elapsed();
     }
@@ -399,49 +558,119 @@ impl Panel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::menu::tests::backdrop;
 
-    /// Every character the lines use has its own picture, and no two look
-    /// alike.
+    fn sample() -> Values {
+        Values {
+            fps: 74.0,
+            ms: 13.5,
+            longest: 65.7,
+            draws: 8123.0,
+            dropped: 2.0,
+            submit_busy: 9.8,
+            waits_gpu: 0.4,
+            gpu_busy: 12.1,
+            idle_behind: 1.4,
+            copy_back: 0.2,
+            recording: 0.0,
+            mb_up: 31.0,
+            textures: 18.0,
+            back: 4.0,
+            ram: 21_500_000_000,
+            in_memory: 14_800_000_000,
+            vram_used: 17_300_000_000,
+            vram_budget: 24_000_000_000,
+            shared: 2_100_000_000,
+            cost_us: 63.0,
+        }
+    }
+
     #[test]
-    fn characters_differ() {
-        let used: Vec<u8> = (b'0'..=b'9').chain(b'A'..=b'Z').chain(*b"./- ").collect();
-        for (i, a) in used.iter().enumerate() {
-            assert_ne!(glyph(*a), glyph(b'#'), "{} has a picture", *a as char);
-            assert!(glyph(*a).iter().all(|row| row >> GLYPH.0 == 0));
-            for b in &used[i + 1..] {
-                assert_ne!(glyph(*a), glyph(*b), "{} {}", *a as char, *b as char);
+    fn the_group_counts_match_the_size() {
+        let g = groups(&sample());
+        assert_eq!((g[0].1.len(), g[1].1.len(), g[2].1.len()), (FRAME_N, CPU_N, MEMORY_N));
+    }
+
+    /// With the frame rate only, the box is just the banner and its bar.
+    #[test]
+    fn the_fps_box_is_much_smaller_and_has_no_second_row() {
+        let (fw, fh) = size(Lines::Full, 1.0);
+        let (sw, sh) = size(Lines::Fps, 1.0);
+        assert!(sh * 4 < fh && sw < fw, "{sw}x{sh} against {fw}x{fh}");
+        assert_eq!(sh as f32, TOP);
+        assert_eq!(Lines::of("fps"), Lines::Fps);
+        assert_eq!(Lines::of("full"), Lines::Full);
+        assert_eq!(Lines::of("anything else"), Lines::Full);
+        let mut text = Text::new().unwrap();
+        let c = paint(&mut text, &sample(), Lines::Fps, 1.0);
+        assert_eq!((c.w as u32, c.h as u32), (sw, sh));
+        // Below the thin bar there is no box at all: the last row of pixels is the rim, not a cut line.
+        let last = &c.px[(c.h - 1) * c.w..];
+        assert!(last[c.w / 2][3] > 0.03, "the box ends with its own rim");
+        // The banner's texts do not run into each other.
+        for scale in [0.8, 1.0, 1.3, 2.0] {
+            let (_, h) = size(Lines::Fps, scale);
+            let c = paint(&mut text, &sample(), Lines::Fps, scale);
+            assert_eq!(c.h as u32, h);
+            let worst = Values { fps: 999.0, ms: 99.9, ..sample() };
+            let (title, fps_left, ms_left) = banner_layout(&mut text, &worst, scale, c.w as f32);
+            assert!(title + 4.0 * scale <= fps_left && fps_left < ms_left, "{title} {fps_left} {ms_left} at {scale}");
+        }
+    }
+
+    #[test]
+    fn the_canvas_matches_the_size_exactly() {
+        let mut text = Text::new().unwrap();
+        for lines in [Lines::Full, Lines::Fps] {
+            for scale in [0.8, 1.0, 1.3, 2.0] {
+                let c = paint(&mut text, &sample(), lines, scale);
+                let (w, h) = size(lines, scale);
+                assert_eq!((c.w as u32, c.h as u32), (w, h), "{lines:?} at {scale}");
             }
         }
-    }
-
-    /// The frame generation line fits the box and says what is shown.
-    #[test]
-    fn generated_frames_are_told() {
-        assert_eq!(generated(27.5, 1), "FRAME GEN OFF");
-        assert_eq!(generated(27.5, 6), "FRAME GEN 6X  SHOWN 165.0 FPS");
-        assert!(generated(999.9, 6).len() <= COLUMNS as usize);
+        // Full is where the layout ends: the footer lies inside the box.
+        let (_, h) = unit(Lines::Full);
+        assert!(h > 300.0 && h < 360.0, "{h}");
     }
 
     #[test]
-    fn a_box_is_painted() {
-        let lines = vec!["I".to_owned(), " i".to_owned()];
-        for scale in [1, 2, 4] {
-            let (width, height) = size(scale);
-            let pitch = (width * 4).next_multiple_of(256) as usize;
-            let colours = colours(DXGI_FORMAT_R10G10B10A2_UNORM).unwrap();
-            let picture = painted(&lines, scale, colours, pitch);
-            assert_eq!(picture.len(), pitch * height as usize);
-            let at = |x: u32, y: u32| &picture[y as usize * pitch + x as usize * 4..][..4];
-            // The rim is black, the first letter's top row lit in its middle.
-            assert_eq!(at(0, 0), colours[0]);
-            assert_eq!(at((RIM + 2) * scale, RIM * scale), colours[1]);
-            assert_eq!(at((RIM + 2) * scale + scale - 1, RIM * scale + scale - 1), colours[1]);
-            assert_eq!(at(RIM * scale, RIM * scale), colours[0]);
-            // Small letters are shown as capitals, a line and a cell on.
-            assert_eq!(at((RIM + CELL.0 + 2) * scale, (RIM + CELL.1) * scale), colours[1]);
-            // Nothing past a line's end.
-            assert_eq!(at((RIM + CELL.0 * 2 + 2) * scale, (RIM + CELL.1) * scale), colours[0]);
+    fn the_box_sits_in_each_corner_inside_the_picture() {
+        for pic in [(1280, 720), (1920, 1080), (3840, 2160)] {
+            for text_size in ["small", "normal", "large"] {
+                for lines in [Lines::Full, Lines::Fps] {
+                    let s = scale(pic, Some(pic), text_size, lines);
+                    let (w, h) = size(lines, s);
+                    let m = (MARGIN * s).round() as u32;
+                    for corner in ["top-left", "top-right", "bottom-left", "bottom-right"] {
+                        let (x, y) = place(corner_of(corner), pic, (w, h), m);
+                        assert!(x + w <= pic.0 && y + h <= pic.1, "{corner} {pic:?} {text_size} {lines:?}");
+                        let (right, bottom) = corner_of(corner);
+                        assert_eq!(x, if right { pic.0 - w - m } else { m });
+                        assert_eq!(y, if bottom { pic.1 - h - m } else { m });
+                    }
+                }
+            }
         }
+        // Too big for the picture: it stays at the edge, never negative.
+        assert_eq!(place((true, true), (100, 50), (300, 200), 14), (0, 0));
+    }
+
+    #[test]
+    fn the_scale_follows_the_size_setting_and_the_window() {
+        let s = |t: &str, p, c| scale(p, c, t, Lines::Full);
+        let p = (1920, 1080);
+        let (small, normal, large) = (s("small", p, Some(p)), s("normal", p, Some(p)), s("large", p, Some(p)));
+        assert!((small / normal - 0.8).abs() < 0.01, "{small} {normal}");
+        assert!((large / normal - 1.3).abs() < 0.01, "{large} {normal}");
+        assert!((normal - 1.0).abs() < 0.01);
+        // Another word is normal.
+        assert_eq!(s("whatever", p, Some(p)), normal);
+        // A 4K picture stretched to a 1080p window: the same share of the window.
+        let big = s("normal", (3840, 2160), Some((1920, 1080)));
+        assert!((big / 2.0 - normal).abs() < 0.01, "{big}");
+        // A small window gives a smaller box, but never an unreadable one.
+        let tiny = s("small", (640, 360), Some((640, 360)));
+        assert!(tiny >= 0.25 && tiny < small);
     }
 
     #[test]
@@ -451,5 +680,29 @@ mod tests {
         (a.0[1], b.0[1]) = (50, 20);
         let c = b.since(a, 10.0);
         assert_eq!((c[0], c[1]), (2.0, 2.0));
+    }
+
+    /// The boxes laid over a stand-in picture the way the card blends them,
+    /// saved for review.
+    #[test]
+    fn the_preview_is_saved() {
+        let mut text = Text::new().unwrap();
+        let dir = std::path::Path::new(r"D:\.devops\.temp\cool_fox\live");
+        std::fs::create_dir_all(dir).unwrap();
+        let v = sample();
+        let save = |text: &mut Text, name: &str, (bw, bh): (usize, usize), lines: Lines, corner: &str, size_text: &str| {
+            let mut pic = backdrop(bw, bh);
+            let s = scale((bw as u32, bh as u32), Some((bw as u32, bh as u32)), size_text, lines);
+            let c = paint(text, &v, lines, s);
+            let m = (MARGIN * s).round() as u32;
+            let (x, y) = place(corner_of(corner), (bw as u32, bh as u32), (c.w as u32, c.h as u32), m);
+            c.composite(&mut pic, bw, x as usize, y as usize, 1.0, s);
+            let png = victory_mcp::shot::encode_png(bw as u32, bh as u32, &pic).unwrap();
+            assert!(png.len() > 10_000);
+            std::fs::write(dir.join(name), png).unwrap();
+        };
+        save(&mut text, "menu4-hud-full.png", (1920, 1080), Lines::Full, "top-left", "normal");
+        save(&mut text, "menu4-hud-fps.png", (1920, 1080), Lines::Fps, "top-right", "normal");
+        save(&mut text, "menu4-hud-4k.png", (3840, 2160), Lines::Full, "bottom-right", "normal");
     }
 }

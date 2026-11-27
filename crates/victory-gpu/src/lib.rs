@@ -51,6 +51,11 @@ mod logstats;
 mod mcp_shot;
 #[cfg(windows)]
 pub use host::menu_key_down;
+#[cfg(windows)]
+mod menu;
+#[cfg(windows)]
+mod menu_env;
+pub mod cheats;
 /// The F1 settings menu is shown (`host/menu.rs`): the title gets no keyboard meanwhile
 /// (read by the input module).
 pub static SETTINGS_MENU_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -116,6 +121,9 @@ mod texback;
 #[cfg(windows)]
 pub use host::on_failure;
 
+/// The live tunables (`victory_core::tunables`), for the crates above this one.
+pub use victory_core::tunables;
+
 /// Whether `switch` is on now, if it is one of those `VICTORY_AB` turns on and
 /// off while the title runs (`ab`).
 #[cfg(all(windows, feature = "diagnostics"))]
@@ -145,3 +153,18 @@ pub use watch::{
     title_memory_reading, title_memory_remapped, title_memory_remapping, title_memory_splitting, title_memory_unmapping,
     title_memory_written, use_lazy_views, use_soft_views, writing as kernel_will_write,
 };
+
+/// Whether the in-game menu ([`menu`]) takes the keyboard key `virtual_key`
+/// now (it is open, or the key was held when it was closed and has not been
+/// let go since): the title must not see it.
+#[cfg(windows)]
+pub fn menu_takes_key(virtual_key: u8) -> bool {
+    menu::takes_key(virtual_key)
+}
+
+/// Whether the in-game menu is open now: the mouse cursor is the user's
+/// (free and visible) while it is.
+#[cfg(windows)]
+pub fn menu_open() -> bool {
+    menu::is_open()
+}

@@ -7,7 +7,9 @@
 //! * [`tunables`]: the registry of the `VICTORY_*` switches, readable and
 //!   changeable at run time (debug server, live settings file).
 
+pub mod cheats;
 pub mod config;
+pub mod keybinds;
 pub mod logging;
 pub mod policy;
 pub mod story_clock;

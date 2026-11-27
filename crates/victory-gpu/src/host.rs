@@ -3845,10 +3845,17 @@ pub(crate) mod aside;
 pub(crate) mod awake;
 mod card_steps;
 pub(crate) mod indirects;
-mod font;
-mod menu;
-pub use menu::key_down as menu_key_down;
 mod panel;
+
+/// Whether the stats panel is shown now (the menu's Overlay page shows it).
+pub(crate) fn stats_panel_shown() -> bool {
+    panel::shown().load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A key went down in our window: whether the menu takes it (the title is not given it then).
+pub fn menu_key_down(virtual_key: u16, _repeat: bool) -> bool {
+    u8::try_from(virtual_key).is_ok_and(crate::menu::takes_key)
+}
 mod place;
 mod send;
 pub(crate) use send::{goes_as_words, words_under};
@@ -9275,7 +9282,7 @@ struct Presenter {
     /// The numbers panel (F3), in every build.
     panel: panel::Panel,
     /// The F1 settings menu.
-    menu: menu::Menu,
+    menu: crate::menu::Menu,
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -10079,8 +10086,9 @@ impl Host {
             } else {
                 crate::popwatch::take(&self.device, list, texture)
             };
-            p.panel.draw(self, copy, &back, (width, height), format);
-            p.menu.draw(self, copy, &back, (width, height), format);
+            p.panel.draw(self, copy, &back, (width, height), format, p.hwnd);
+            // After the title's picture and the overlay, in the copy-destination state.
+            p.menu.draw(self, &copy.list, &back, (width, height), format, p.hwnd);
             if composed {
                 list.ResourceBarrier(&[transition(
                     &back,
@@ -10157,7 +10165,6 @@ impl Host {
             crate::streamline::present_ends(presenting);
             showing.next("the frame meter");
             p.panel.frame(p.meter.line_due());
-            p.menu.frame();
             p.meter.frame(p.hwnd);
             showing.end();
             #[cfg(feature = "diagnostics")]
@@ -10245,7 +10252,7 @@ impl Host {
                 meter: Meter::new(),
                 composer: None,
                 panel: panel::Panel::new(),
-                menu: menu::Menu::new(),
+                menu: crate::menu::Menu::new(),
             })
         }
     }
