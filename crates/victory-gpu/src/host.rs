@@ -2369,6 +2369,8 @@ enum Step {
 struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
+    /// The last title-memory write, if it was a recorded GPU copy.
+    last_placed: Option<usize>,
     uploads: Vec<ID3D12Resource>,
     /// Standalone upload footprints kept through this list's fence (movie planes).
     plane_uploads: Vec<(Chunk, u64)>,
@@ -2431,6 +2433,7 @@ impl Deferred {
     /// The steps recorded last write title memory: what was brought up to
     /// date before them is not any more.
     fn title_written(&mut self) {
+        self.last_placed = None;
         self.refreshed.clear();
         self.gpu_written.clear();
         self.filled.clear();
@@ -3075,26 +3078,40 @@ fn copy_blocked(written: &[(usize, usize)], dst: usize, src: usize, len: usize) 
 /// may write (in order, joined); `count` whether the kind of read is
 /// counted for the frame line.
 fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Option<usize> {
+    blocked_by_pending(written, runs, count, |_, _| false).map(|(wait, _)| wait)
+}
+
+/// The same check after a submission has assigned some steps to the card.
+fn blocked_by_pending(
+    written: &[(usize, usize)],
+    runs: &[&HostList],
+    count: bool,
+    taken: impl Fn(&HostList, usize) -> bool,
+) -> Option<(usize, &'static str)> {
     if written.is_empty() {
         return None;
     }
     // Destinations of copies at their place, if a step reads them.
     let mut placed: Vec<(usize, usize)> = Vec::new();
     for list in runs {
-        for step in &list.deferred().copies {
+        for (i, step) in list.deferred().copies.iter().enumerate() {
+            if taken(list, i) {
+                continue;
+            }
             match step {
                 &Step::Copy(dst, src, len) => {
-                    if let Some(_read) = copy_blocked(written, dst, src, len) {
+                    if let Some(read) = copy_blocked(written, dst, src, len) {
                         if count {
                             LATE_STATS[15].fetch_add(1, Ordering::Relaxed);
                             #[cfg(feature = "diagnostics")]
-                            if _read {
+                            if read {
                                 blame("a buffer copy's source", written, src, len);
                             } else {
                                 blame("a buffer copy's destination", written, dst, len);
                             }
                         }
-                        return Some(WHY_READ);
+                        let what = if read { "a CPU buffer copy reads an in-flight write" } else { "a CPU buffer copy overlaps an in-flight write" };
+                        return Some((WHY_READ, what));
                     }
                 }
                 &Step::Fill(_, src, len, _) => {
@@ -3104,7 +3121,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                             #[cfg(feature = "diagnostics")]
                             blame("a fill of upload memory", written, src, len);
                         }
-                        return Some(WHY_READ);
+                        return Some((WHY_READ, "a CPU upload reads an in-flight write"));
                     }
                 }
                 Step::Texture(staging) => {
@@ -3115,7 +3132,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                             #[cfg(feature = "diagnostics")]
                             blame("a texture", written, at, len);
                         }
-                        return Some(WHY_READ);
+                        return Some((WHY_READ, "a texture upload reads an in-flight write"));
                     }
                 }
                 &Step::Plane((at, len), _) => {
@@ -3125,10 +3142,10 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                             #[cfg(feature = "diagnostics")]
                             blame("a movie plane", written, at, len);
                         }
-                        return Some(WHY_READ);
+                        return Some((WHY_READ, "a movie plane reads an in-flight write"));
                     }
                 }
-                Step::Run(_) => return Some(WHY_RUN),
+                Step::Run(_) => return Some((WHY_RUN, "a host callback must run on the CPU")),
                 Step::Placed(p) => match p.waits(written) {
                     place::Waits::No => {}
                     place::Waits::ForReaders => placed.push((p.dst, p.dst + p.len)),
@@ -3138,14 +3155,17 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                             #[cfg(feature = "diagnostics")]
                             blame("a buffer copy at its place", written, p.src, p.len);
                         }
-                        return Some(WHY_READ);
+                        return Some((WHY_READ, "a recorded copy needs its source staged by the CPU"));
                     }
                 },
                 Step::Refresh(..) | Step::GpuWrite(..) | Step::Host(..) => {}
             }
         }
     }
-    (!placed.is_empty() && place::read_by(runs, placed)).then_some(WHY_READ)
+    if placed.is_empty() {
+        return None;
+    }
+    place::cpu_reader(runs, written, placed, taken).map(|what| (WHY_READ, what))
 }
 
 /// With flights in the air, after the submission's write-watch asking:
@@ -5731,16 +5751,10 @@ impl Host {
                 }
             }
         };
-        // That list runs first, and is one of the submission's from here on.
-        let with: Vec<&HostList>;
-        let runs = match &own {
-            Some(own) => {
-                with = std::iter::once(own.list()).chain(runs.iter().copied()).collect();
-                &with[..]
-            }
-            None => runs,
-        };
-        let parts: Vec<usize> = parts.iter().map(|&n| n + usize::from(own.is_some())).collect();
+        // The GPU upload lists are part of this submission, in dependency
+        // order, under the same submission lock and completion fence.
+        let ordered = own.as_ref().map(|own| own.ordered_lists(runs, parts));
+        let (runs, parts) = ordered.as_ref().map_or((runs, parts), |(lists, boundaries)| (lists.as_slice(), boundaries.as_slice()));
         // The plan for two queues: the textures' states before the preludes
         // move them.
         let probe = two_queues::on().then(|| two_queues::probe(runs));
@@ -5825,7 +5839,7 @@ impl Host {
         let air = line().written.clone();
         stage.next("submit: refreshes ahead of writes");
         if refresh_front() {
-            batch.refresh_front(runs, &parts);
+            batch.refresh_front(runs, parts);
         } else if ahead_of_writes() {
             batch.refresh_ahead(runs, |list, i| own.as_ref().is_some_and(|own| own.takes(list, i)));
         }

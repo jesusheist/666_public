@@ -4644,6 +4644,12 @@ impl State {
                 let used = group.entry(k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
+                        if let Some(buffer) = list.placed_constant(address, size as usize) {
+                            // SAFETY: this is the fresh buffer retained by the recording.
+                            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+                            host.constant_at(index, &buffer, gpu, size);
+                            continue;
+                        }
                         let Some((buffer, gpu, to)) = list.scratch_held(u64::from(size)) else {
                             host.make_null(index);
                             continue;

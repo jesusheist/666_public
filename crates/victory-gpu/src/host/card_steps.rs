@@ -7,10 +7,9 @@ use std::sync::Arc;
 use super::*;
 use crate::shadow::Shadow;
 
-/// The stage (`VICTORY_CARD_STEPS`; off by default): `1` constant buffers
-/// of descriptor tables (`Step::Fill` with a slot of its own), `2` the
-/// title's buffer copies (`Step::Copy`) too, with the steps of the same
-/// submission that depend on them. Only with the relay's second stage
+/// The stage (`VICTORY_CARD_STEPS`; off by default): `1` private fills and
+/// copies needed to submit them, `2` also handles copies in submissions
+/// without a blocked private fill. Only with the relay's second stage
 /// (`relay_exact`).
 ///
 /// Why: eleven dispatches a frame (the skinning passes, in two early
@@ -73,7 +72,8 @@ use crate::shadow::Shadow;
 /// a list is recorded). With the CPU's copy such a read of the destination
 /// found the bytes at once; now it finds them when the flight has landed.
 /// The landing tells the guards (`crate::watch::landing`), so a texture
-/// made from older bytes is made again. This is why stage 2 is its own.
+/// made from older bytes is made again. Stage 1 only considers deferring a
+/// copy when the submission would otherwise wait on a private fill.
 pub(super) fn stage() -> u32 {
     static STAGE: OnceLock<u32> = OnceLock::new();
     *STAGE.get_or_init(|| match std::env::var("VICTORY_CARD_STEPS").ok().as_deref() {
@@ -93,10 +93,10 @@ pub(super) fn footprint_fills() -> bool {
 pub(super) const MAX_FOOTPRINT_FILL: usize = 256 << 10;
 pub(super) const MAX_FOOTPRINT_UPLOADS_PER_LIST: u64 = 1 << 20;
 
-/// Whether a copy at its place in a list ([`place`]) is only in the way of
-/// what is done on the card in front of the lists if that stands behind it in
-/// them (`VICTORY_PLACED_ORDER=1`; off: wherever it stands), and a
-/// submission where it does is cut behind the copy's list ([`cut_for`]). Off:
+/// Whether a copy at its place in a list ([`place`]) can be ordered relative
+/// to other copies moved onto the card (`VICTORY_PLACED_ORDER=1`), and a
+/// submission can be cut behind the copy's list ([`cut_for`]). The fill-only
+/// plan can already keep a read before a later copy. Off:
 /// the case did not come up once in runs submit-1 to submit-3, so it has only
 /// its tests behind it.
 ///
@@ -184,7 +184,7 @@ pub(super) fn writers(items: &[Late]) -> Vec<Writer> {
 
 /// The destinations of copies done here that have not landed.
 pub(super) fn copies(line: &Line) -> Vec<Writer> {
-    if stage() < 2 {
+    if stage() == 0 {
         return Vec::new();
     }
     let flying = line.line.iter().filter_map(|l| match l {
@@ -285,7 +285,7 @@ fn plan(does: &[Does], stage: u32, by_order: bool, behind: &mut Option<(usize, u
         for &i in &more {
             takes(&does[i])?;
         }
-        return plan_fills(does, more, by_order, behind);
+        return plan_fills(does, more, behind);
     }
     let mut taken = vec![false; does.len()];
     let (mut read, mut written) = (Vec::new(), Vec::new());
@@ -399,7 +399,7 @@ const COPY_NEEDS_STAGE_TWO: &str = "a buffer copy (VICTORY_CARD_STEPS=2 does it 
 
 /// Stage 1 only reads title memory. All fills belong to one level, but a
 /// copy that writes any of their bytes still prevents moving them.
-fn plan_fills(does: &[Does], fills: Vec<usize>, by_order: bool, behind: &mut Option<(usize, usize)>) -> Result<Vec<(usize, u32)>, &'static str> {
+fn plan_fills(does: &[Does], fills: Vec<usize>, behind: &mut Option<(usize, usize)>) -> Result<Vec<(usize, u32)>, &'static str> {
     if fills.len() > MOST {
         return Err("too many steps depend on it");
     }
@@ -421,7 +421,7 @@ fn plan_fills(does: &[Does], fills: Vec<usize>, by_order: bool, behind: &mut Opt
                 .copied()
                 .find(|&i| reads_writes(&does[i]).is_some_and(|(read, _)| meet(read, (dst, dst + len))));
             *behind = found.map(|i| (p, i));
-            if !by_order || found.is_some() {
+            if found.is_some() {
                 return Err(BEHIND_PLACED);
             }
         }
@@ -463,14 +463,22 @@ fn holder(writers: &[Writer], from: usize, to: usize) -> Result<Arc<Shadow>, &'s
 
 /// What the steps of `runs` do, and which step each is (its list by address,
 /// its place in it). `written`: what flights may write.
-fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(usize, usize)>) {
+fn does_of(
+    written: &[(usize, usize)],
+    runs: &[&HostList],
+    include_copy_readers: bool,
+    queued: &StepSet,
+) -> (Vec<Does>, Vec<StepKey>) {
     let mut does = Vec::new();
-    let fill_only = stage() == 1;
     // Which step each is. One list's lock at a time: a submission may
     // name a list twice.
     let mut steps = Vec::new();
     for list in runs {
+        let address = std::ptr::from_ref::<HostList>(list) as usize;
         for (i, step) in list.deferred().copies.iter().enumerate() {
+            if !queued.is_empty() && queued.contains(&(address, i)) {
+                continue;
+            }
             does.push(match step {
                 &Step::Copy(dst, src, len) => Does::Copy {
                     dst,
@@ -497,9 +505,9 @@ fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(u
                     to: at.saturating_add(len),
                     asked: touches(written, at, at.saturating_add(len)),
                 },
-                &Step::Host(_, (from, to)) if !fill_only && from < to => Does::Read { from, to, asked: false },
-                // Stage 1 writes no title bytes, so these reads cannot depend on it.
-                Step::Refresh(..) if fill_only => continue,
+                &Step::Host(_, (from, to)) if include_copy_readers && from < to => Does::Read { from, to, asked: false },
+                // A fill-only plan writes no title bytes.
+                Step::Refresh(..) if !include_copy_readers => continue,
                 Step::Refresh(shadow, at, len) => Does::Refresh {
                     shadow: Arc::as_ptr(shadow) as usize,
                     from: *at,
@@ -509,10 +517,108 @@ fn does_of(written: &[(usize, usize)], runs: &[&HostList]) -> (Vec<Does>, Vec<(u
                 Step::Placed(p) => Does::Placed { dst: p.dst, src: p.src, len: p.len },
                 Step::GpuWrite(..) | Step::Host(..) => continue,
             });
-            steps.push((std::ptr::from_ref::<HostList>(list) as usize, i));
+            steps.push((address, i));
         }
     }
     (does, steps)
+}
+
+type StepKey = (usize, usize);
+type StepSet = std::collections::HashSet<StepKey, std::hash::BuildHasherDefault<AddressHash>>;
+
+struct QueuedConstant {
+    before: usize,
+    step: StepKey,
+    source: Arc<Shadow>,
+    address: usize,
+    len: usize,
+    slot: (usize, u32),
+}
+
+/// Find constant uploads that must follow a GPU copy from an earlier list.
+/// An overlapping title write or a write through another shadow invalidates
+/// the source. The original CPU wait handles those cases.
+fn queued_constants(written: &[(usize, usize)], runs: &[&HostList]) -> Vec<QueuedConstant> {
+    let mut constants = Vec::new();
+    let mut sources: Vec<(usize, (usize, usize), Arc<Shadow>)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (list_at, list) in runs.iter().enumerate() {
+        let address = std::ptr::from_ref::<HostList>(list) as usize;
+        if !seen.insert(address) {
+            // A repeated recording shares its descriptor slots.
+            return Vec::new();
+        }
+        for (step_at, step) in list.deferred().copies.iter().enumerate() {
+            match step {
+                Step::Placed(copy) => {
+                    let range = (copy.dst, copy.dst + copy.len);
+                    sources.retain(|(_, active, _)| !meet(*active, range));
+                    if copy.gpu_sourced() && matches!(copy.waits(written), place::Waits::ForReaders) {
+                        sources.push((list_at, range, copy.shadow.clone()));
+                    }
+                }
+                &Step::Copy(dst, _, len) => sources.retain(|(_, active, _)| !meet(*active, (dst, dst + len))),
+                Step::GpuWrite(shadow, dst, len) => {
+                    sources.retain_mut(|(last_writer, active, source)| {
+                        if !meet(*active, (*dst, *dst + *len)) {
+                            return true;
+                        }
+                        if Arc::ptr_eq(shadow, source) {
+                            *last_writer = list_at;
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                }
+                Step::Run(_) => return Vec::new(),
+                &Step::Fill(_, src, len, Some(FillTo::Slot(heap, slot))) if (1..=64 << 10).contains(&len) => {
+                    if let Some((_, _, source)) = sources.iter().find(|(producer, (from, to), _)| {
+                        *producer < list_at && *from == src && *to == src + len
+                    }) {
+                        constants.push(QueuedConstant {
+                            before: list_at,
+                            step: (address, step_at),
+                            source: source.clone(),
+                            address: src,
+                            len,
+                            slot: (heap, slot),
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    constants
+}
+
+struct PlannedSteps {
+    does: Vec<Does>,
+    steps: Vec<StepKey>,
+    chosen: Result<Vec<(usize, u32)>, &'static str>,
+}
+
+fn plan_runs(
+    written: &[(usize, usize)],
+    runs: &[&HostList],
+    by_order: bool,
+    behind: &mut Option<(usize, usize)>,
+    queued: &StepSet,
+) -> PlannedSteps {
+    let stage = stage();
+    let (mut does, mut steps) = does_of(written, runs, stage >= 2, queued);
+    let mut chosen = plan(&does, stage, by_order, behind);
+    if stage == 1
+        && chosen.as_ref().err() == Some(&COPY_NEEDS_STAGE_TWO)
+        && does.iter().any(|d| matches!(d, Does::Fill { asked: true, to: true, .. }))
+    {
+        // The fill-only pass omitted CPU reads and refreshes that cannot
+        // depend on a fill. Include them before moving any title writes.
+        (does, steps) = does_of(written, runs, true, queued);
+        chosen = plan(&does, 2, by_order, behind);
+    }
+    PlannedSteps { does, steps, chosen }
 }
 
 /// With flights in the air: before which of `runs` the submission is cut so
@@ -530,9 +636,9 @@ pub(super) fn cut_for(runs: &[&HostList]) -> Option<usize> {
     }
     let written = line().written.clone();
     blocked_by(&written, runs, false)?;
-    let (does, steps) = does_of(&written, runs);
     let mut behind = None;
-    if plan(&does, stage(), true, &mut behind) != Err(BEHIND_PLACED) {
+    let PlannedSteps { steps, chosen, .. } = plan_runs(&written, runs, true, &mut behind, &StepSet::default());
+    if chosen != Err(BEHIND_PLACED) {
         return None;
     }
     let (placed, reader) = behind?;
@@ -656,6 +762,12 @@ struct Own {
     between: ID3D12Resource,
 }
 
+struct QueuedList {
+    before: usize,
+    own: Own,
+    slots: Vec<((usize, u32), u64, u32)>,
+}
+
 // SAFETY: D3D12 objects are free-threaded, and the list is touched by one
 // thread at a time (the submitting one until it is sent, then the one that
 // lands it, then nobody until it is taken out of `POOL`).
@@ -669,18 +781,64 @@ static POOL: Mutex<Vec<Own>> = Mutex::new(Vec::new());
 static DONE: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 static REFUSALS: Mutex<Option<std::collections::BTreeMap<&'static str, u64>>> = Mutex::new(None);
 
+fn activate_queued(lists: Vec<QueuedList>, constants: &[QueuedConstant]) -> Vec<(usize, Own)> {
+    if lists.is_empty() {
+        return Vec::new();
+    }
+    let taken = lists
+        .into_iter()
+        .map(|QueuedList { before, own, slots }| {
+            // SAFETY: the prelude keeps its staging buffer through the fence.
+            let gpu = unsafe { own.between.GetGPUVirtualAddress() };
+            for ((heap, slot), at, len) in slots {
+                crate::descriptor::constant_slot(heap, slot, &own.between, gpu + at, len);
+            }
+            (before, own)
+        })
+        .collect();
+    DONE[0].fetch_add(constants.len() as u64, Ordering::Relaxed);
+    DONE[2].fetch_add(constants.iter().map(|constant| constant.len as u64).sum(), Ordering::Relaxed);
+    #[cfg(feature = "diagnostics")]
+    if !constants.is_empty() && crate::asked_for!("VICTORY_PLACED_UPLOAD_TRACE") {
+        static FIRST: std::sync::Once = std::sync::Once::new();
+        FIRST.call_once(|| tracing::info!(count = constants.len(), "constant uploads ordered after a preceding GPU list"));
+    }
+    taken
+}
+
 /// What [`Host::card_steps`] took off a submission: the list that does it,
 /// for the submission to run first, and the steps the CPU leaves out (their
 /// list by address, their place in it).
 pub(super) struct Taken {
-    own: Own,
-    steps: std::collections::HashSet<(usize, usize), std::hash::BuildHasherDefault<AddressHash>>,
+    own: Option<Own>,
+    queued: Vec<(usize, Own)>,
+    steps: StepSet,
     copied: Vec<(Arc<Shadow>, usize, usize)>,
 }
 
 impl Taken {
-    pub(super) fn list(&self) -> &HostList {
-        &self.own.list
+    /// Insert a prelude immediately before each consumer list. A separate
+    /// ExecuteCommandLists call lets the producer's buffers decay to COMMON
+    /// before the prelude copies them.
+    pub(super) fn ordered_lists<'a>(&'a self, runs: &[&'a HostList], parts: &[usize]) -> (Vec<&'a HostList>, Vec<usize>) {
+        let mut lists = Vec::with_capacity(runs.len() + self.queued.len() + usize::from(self.own.is_some()));
+        let mut boundaries = Vec::with_capacity(parts.len() + 2 * self.queued.len());
+        if let Some(own) = &self.own {
+            lists.push(&own.list);
+        }
+        let mut queued = self.queued.iter().peekable();
+        for (index, &list) in runs.iter().enumerate() {
+            let prelude = queued.next_if(|(before, _)| *before == index);
+            if !lists.is_empty() && (prelude.is_some() || parts.contains(&index)) {
+                boundaries.push(lists.len());
+            }
+            if let Some((_, own)) = prelude {
+                lists.push(&own.list);
+                boundaries.push(lists.len());
+            }
+            lists.push(list);
+        }
+        (lists, boundaries)
     }
 
     /// Whether step `i` of `list` is done by this.
@@ -701,8 +859,10 @@ impl Taken {
     pub(super) fn landed(self) {
         // The host copies its steps held go; its commands stay until the
         // next use resets it.
-        drop(std::mem::take(&mut *self.own.list.deferred()));
-        POOL.lock().unwrap_or_else(|e| e.into_inner()).push(self.own);
+        for own in self.own.into_iter().chain(self.queued.into_iter().map(|(_, own)| own)) {
+            drop(std::mem::take(&mut *own.list.deferred()));
+            POOL.lock().unwrap_or_else(|e| e.into_inner()).push(own);
+        }
     }
 }
 
@@ -743,10 +903,27 @@ impl Host {
 
     fn take_steps(&self, written: &[(usize, usize)], runs: &[&HostList]) -> Result<Option<Taken>, &'static str> {
         let mut spent = crate::timeline::span("steps on the card: chosen");
-        let (does, steps) = does_of(written, runs);
-        let chosen = plan(&does, stage(), placed_order(), &mut None)?;
-        if chosen.is_empty() {
+        let queued = if runs.len() >= 2 && crate::asked_for!("VICTORY_QUEUED_CONSTANTS") {
+            queued_constants(written, runs)
+        } else {
+            Vec::new()
+        };
+        let mut taken: StepSet = queued.iter().map(|constant| constant.step).collect();
+        let PlannedSteps { does, steps, chosen } = plan_runs(written, runs, placed_order(), &mut None, &taken);
+        let chosen = chosen?;
+        if chosen.is_empty() && queued.is_empty() {
             return Ok(None);
+        }
+        taken.extend(chosen.iter().map(|&(i, _)| steps[i]));
+        // A placed copy can still need a CPU upload of its source, or leave
+        // a CPU consumer waiting for its destination. The plan only claims
+        // steps it can move, so check the steps it would leave behind.
+        if does.iter().any(|step| matches!(step, Does::Placed { .. }))
+            && let Some((_, what)) = blocked_by_pending(written, runs, false, |list, i| {
+                taken.contains(&(std::ptr::from_ref(list) as usize, i))
+            })
+        {
+            return Err(what);
         }
         spent.next("steps on the card: what holds their bytes");
         let mut writers = {
@@ -835,6 +1012,15 @@ impl Host {
                 to,
             });
         }
+        let queued_lists = self.record_queued_constants(&queued, &mut room)?;
+        if ops.is_empty() && !queued.is_empty() {
+            return Ok(Some(Taken {
+                own: None,
+                queued: activate_queued(queued_lists, &queued),
+                steps: taken,
+                copied: Vec::new(),
+            }));
+        }
         spent.next("steps on the card: the list");
         let Some(own) = self.own_list() else {
             return Err("no host list or buffer for it");
@@ -911,10 +1097,41 @@ impl Host {
         noted(&ops);
         spent.end();
         Ok(Some(Taken {
-            own,
-            steps: chosen.iter().map(|&(i, _)| steps[i]).collect(),
+            own: Some(own),
+            queued: activate_queued(queued_lists, &queued),
+            steps: taken,
             copied,
         }))
+    }
+
+    fn record_queued_constants(
+        &self,
+        queued: &[QueuedConstant],
+        mapped_pages: &mut HashMap<usize, ()>,
+    ) -> Result<Vec<QueuedList>, &'static str> {
+        let mut lists = Vec::new();
+        for group in queued.chunk_by(|a, b| a.before == b.before) {
+            let own = self.own_list().ok_or("no queue prelude for the placed constants")?;
+            let mut reads = Vec::new();
+            let mut slots = Vec::new();
+            let mut end = 0;
+            for constant in group {
+                let len = constant.len as u64;
+                if end + len > BETWEEN {
+                    return Err("too many constants behind the placed copies");
+                }
+                if !mapped(constant.address, constant.address + constant.len, mapped_pages) {
+                    return Err("a constant behind a placed copy is not mapped");
+                }
+                reads.push((&constant.source.buffer, constant.source.offset(constant.address as u64), end, len));
+                slots.push((constant.slot, end, len as u32));
+                end = (end + len).next_multiple_of(256);
+            }
+            record(true, &own.list.list, &own.between, &reads, &[]);
+            own.list.close();
+            lists.push(QueuedList { before: group[0].before, own, slots });
+        }
+        Ok(lists)
     }
 
     /// A list of ours open for recording, and its buffer.
@@ -1107,7 +1324,8 @@ mod tests {
         let mut behind = None;
         assert_eq!(plan(&[fill, placed], 1, true, &mut behind), Ok(vec![(0, 0)]));
         assert_eq!(behind, None);
-        assert_eq!(plan(&[fill, placed], 1, false, &mut None), Err(BEHIND_PLACED));
+        assert_eq!(plan(&[fill, placed], 1, false, &mut None), Ok(vec![(0, 0)]));
+        assert_eq!(plan(&[placed, fill], 1, false, &mut None), Err(BEHIND_PLACED));
         assert_eq!(plan(&[placed, fill], 1, true, &mut behind), Err(BEHIND_PLACED));
         assert_eq!(behind, Some((0, 1)));
 
@@ -1317,6 +1535,162 @@ mod tests {
         host.execute(&[&own.list, &consumer]);
         // SAFETY: execute waited for the consuming copy to finish.
         assert_eq!(unsafe { std::slice::from_raw_parts(read, 256) }, &expected);
+    }
+
+    #[test]
+    #[ignore = "wants VICTORY_RELAY=2 VICTORY_CARD_STEPS=1 VICTORY_ORDERED_FOOTPRINT_FILLS=1"]
+    fn private_fills_keep_their_order_around_a_title_copy() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        assert!(footprint_fills());
+        let host = host().expect("this test needs a D3D12 device");
+        const HEAP: usize = 2 << 20;
+        const BYTES: usize = 32;
+        const SOURCE: usize = 256;
+        const DESTINATION: usize = 512;
+        const WORK: u64 = 32 << 20;
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        // SAFETY: this allocation belongs to the test process and the shadow
+        // keeps its address until the process exits.
+        let title = unsafe { VirtualAlloc(std::ptr::null(), HEAP, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) }.cast::<u8>();
+        assert!(!title.is_null());
+        crate::shadow::register(0x3535, title as u64, HEAP as u64);
+        let shadow = crate::shadow::find(title as u64, HEAP as u64).expect("title heap shadow");
+        let (shader_output, write) = host.upload_buffer(BYTES as u64).unwrap();
+        let expected: [u8; BYTES] = std::array::from_fn(|i| 0x80 + i as u8);
+        let first = host.new_list().unwrap();
+        shadow.refresh(&first, title as u64, HEAP as u64);
+        shadow.gpu_writes(&first, title as u64, HEAP as u64);
+        let (slow_from, slow_to) = (host.uav_buffer(WORK).unwrap(), host.uav_buffer(WORK).unwrap());
+        // SAFETY: the mappings, buffers and command list are live and
+        // each copy fits. The work keeps the producer flight in the queue.
+        unsafe {
+            std::ptr::copy_nonoverlapping(expected.as_ptr(), write, BYTES);
+            for _ in 0..32 {
+                first.list.CopyBufferRegion(&slow_to, 0, &slow_from, 0, WORK);
+            }
+            first.list.CopyBufferRegion(&shadow.buffer, SOURCE as u64, &shader_output, 0, BYTES as u64);
+            first.list.ResourceBarrier(&[transition(
+                &shadow.buffer,
+                D3D12_RESOURCE_STATE_COPY_DEST,
+                D3D12_RESOURCE_STATE_COMMON,
+            )]);
+        }
+        first.close();
+        host.execute_own(&first);
+
+        let consumer = host.new_list().unwrap();
+        // SAFETY: both ranges are within the mapped title allocation.
+        let (src, dst) = unsafe { (title.add(SOURCE), title.add(DESTINATION)) };
+        let before = consumer.upload_footprint(host, dst, BYTES).unwrap();
+        consumer.defer_copy(dst, src, BYTES);
+        let after = consumer.upload_footprint(host, dst, BYTES).unwrap();
+        let (result, data) = host.shared_buffer((2 * BYTES) as u64).unwrap();
+        // SAFETY: all buffers and the open list are live and the ranges fit.
+        unsafe {
+            consumer.list.CopyBufferRegion(&result, 0, &before, 0, BYTES as u64);
+            consumer.list.CopyBufferRegion(&result, BYTES as u64, &after, 0, BYTES as u64);
+        }
+        consumer.close();
+        let copies = DONE[1].load(Ordering::Relaxed);
+        host.execute_own(&consumer);
+        settle_now(WHY_SYNC);
+        assert_eq!(DONE[1].load(Ordering::Relaxed) - copies, 1, "the title copy waited on the CPU");
+        // SAFETY: the consumer and title copy-back have both finished.
+        unsafe {
+            assert_eq!(std::slice::from_raw_parts(data, BYTES), &[0; BYTES]);
+            assert_eq!(std::slice::from_raw_parts(data.add(BYTES), BYTES), &expected);
+            assert_eq!(std::slice::from_raw_parts(dst, BYTES), &expected);
+        }
+        assert_eq!(host.log_messages(), None);
+    }
+
+    #[test]
+    #[ignore = "wants VICTORY_RELAY=2 VICTORY_CARD_STEPS=1 VICTORY_ORDERED_FOOTPRINT_FILLS=1"]
+    fn a_placed_copy_still_blocks_a_cpu_reader() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        assert!(footprint_fills());
+        let host = host().expect("this test needs a D3D12 device");
+        const HEAP: usize = 64 << 10;
+        // SAFETY: this allocation belongs to the test process and the
+        // registered shadow keeps its address until the process exits.
+        let title = unsafe { VirtualAlloc(std::ptr::null(), HEAP, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert_ne!(title, 0);
+        crate::shadow::register(0x4242, title as u64, HEAP as u64);
+        let shadow = crate::shadow::find(title as u64, HEAP as u64).unwrap();
+        let list = host.new_list().unwrap();
+        let (src, dst, len) = (title, title + 256, 32);
+        list.upload_footprint(host, dst as *const u8, len).unwrap();
+        assert!(list.place_copy(dst, src, len));
+        let written = [(dst, dst + len)];
+        let taken = |_: &HostList, i| i == 0;
+        assert_eq!(blocked_by(&written, &[&list], false), Some(WHY_READ));
+        assert_eq!(blocked_by_pending(&written, &[&list], false, taken), None);
+        list.defer_host_read(dst, len, || {});
+        assert_eq!(
+            blocked_by_pending(&written, &[&list], false, taken),
+            Some((WHY_READ, "a CPU callback reads a recorded copy's destination")),
+        );
+        list.close();
+        drop(shadow);
+    }
+
+    #[test]
+    fn queued_constant_uses_the_preceding_lists_gpu_copy() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+        let host = host().expect("this test needs a D3D12 device");
+        const HEAP: usize = 64 << 10;
+        const BYTES: usize = 240;
+        // SAFETY: the test process owns this allocation, and the registered
+        // shadow keeps its address until the process exits.
+        let title = unsafe { VirtualAlloc(std::ptr::null(), HEAP, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert_ne!(title, 0);
+        let (src, dst) = (title, title + 256);
+        let expected: [u8; BYTES] = std::array::from_fn(|i| i.wrapping_mul(11) as u8);
+        crate::shadow::register(0x4245, title as u64, HEAP as u64);
+        let shadow = crate::shadow::find(title as u64, HEAP as u64).unwrap();
+        let (upload, data) = host.shared_buffer(BYTES as u64).unwrap();
+        // SAFETY: the mapped upload contains BYTES bytes and is kept alive.
+        unsafe { std::ptr::copy_nonoverlapping(expected.as_ptr(), data, BYTES) };
+        let producer = host.new_list().unwrap();
+        shadow.refresh(&producer, src as u64, BYTES as u64);
+        shadow.gpu_writes(&producer, src as u64, BYTES as u64);
+        // SAFETY: the list is open and both buffers cover the copy.
+        unsafe { producer.list.CopyBufferRegion(&shadow.buffer, shadow.offset(src as u64), &upload, 0, BYTES as u64) };
+        assert!(producer.place_copy(dst, src, BYTES));
+        let consumer = host.new_list().unwrap();
+        let (_, _, scratch) = consumer.scratch_held(BYTES as u64).unwrap();
+        consumer.defer_constants(scratch, dst as *const u8, BYTES, (0, 0));
+        let written = [(src, src + BYTES)];
+        assert_eq!(blocked_by(&written, &[&consumer, &producer], false), None);
+        assert_eq!(blocked_by(&written, &[&producer, &consumer], false), Some(WHY_READ));
+        assert!(queued_constants(&written, &[&consumer, &producer]).is_empty());
+        assert!(queued_constants(&written, &[&producer, &consumer, &consumer]).is_empty());
+        let constants = queued_constants(&written, &[&producer, &consumer]);
+        assert_eq!(constants.len(), 1);
+        let prelude = host.record_queued_constants(&constants, &mut HashMap::default()).unwrap().pop().unwrap();
+        let (readback, result) = host.shared_buffer(BYTES as u64).unwrap();
+        // SAFETY: the ordered submission keeps all resources alive, and
+        // the prelude leaves the intermediate buffer readable by a copy.
+        unsafe { consumer.list.CopyBufferRegion(&readback, 0, &prelude.own.between, 0, BYTES as u64) };
+        producer.close();
+        consumer.close();
+        let taken = Taken {
+            own: None,
+            queued: vec![(prelude.before, prelude.own)],
+            steps: constants.iter().map(|constant| constant.step).collect(),
+            copied: Vec::new(),
+        };
+        let (lists, boundaries) = taken.ordered_lists(&[&producer, &consumer], &[1]);
+        assert_eq!(boundaries, [1, 2]);
+        assert!(std::ptr::eq(lists[0], &producer));
+        assert!(std::ptr::eq(lists[2], &consumer));
+        for list in lists {
+            host.execute_sync_internal(list);
+        }
+        // SAFETY: the consumer finished before the synchronous call returned.
+        assert_eq!(unsafe { std::slice::from_raw_parts(result, BYTES) }, &expected);
+        assert_eq!(host.log_messages(), None);
+        taken.landed();
     }
 
     /// The whole way, in a process of its own with the relay on:
