@@ -90,7 +90,7 @@ fn initialize_list_and_get_stats_over_a_socket() {
 
     let list = json(&post(addr, r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#));
     let Some(Json::Arr(tools)) = list.get("result").and_then(|r| r.get("tools")) else { panic!("{list:?}") };
-    assert_eq!(tools.len(), 32);
+    assert_eq!(tools.len(), 33);
 
     // Fake published data, as the frame meter publishes it.
     shared.publish_stats(Stats {
