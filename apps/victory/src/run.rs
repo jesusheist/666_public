@@ -340,9 +340,17 @@ pub fn run(
             }
         }
     }
-    if std::env::var_os("VICTORY_STORY_CLOCK").is_some_and(|value| value == "1") {
+    let clock = std::env::var_os("VICTORY_STORY_CLOCK").is_some_and(|value| value == "1");
+    let cheats = std::env::var_os("VICTORY_CHEATS").is_some_and(|value| value == "1");
+    if clock || cheats {
         // SAFETY: the verified image is still idle and stays loaded through title execution.
-        unsafe { victory_loader::story_clock::install(&image, hash.as_str())? };
+        let done = unsafe { victory_loader::story_clock::install(&image, hash.as_str(), clock, cheats) };
+        match done {
+            Ok(()) => {}
+            // Cheats alone never stop the start; the clock keeps its old strictness.
+            Err(why) if !clock => eprintln!("title cheats are unavailable: {why:#}"),
+            Err(why) => return Err(why),
+        }
     }
     victory_loader::report_crashes();
     victory_loader::log_crashes_to(temp.with_file_name("crashes.log"));

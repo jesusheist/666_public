@@ -1,6 +1,9 @@
-//! Build-specific binding to the offline title's clock.
+//! Build-specific binding to the offline title's clock, and the shared "title
+//! tick" hook: one patched call site on the title's game thread that runs the
+//! story clock (when asked) and the queued cheats (when asked).
 
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Result, ensure};
 use victory_core::story_clock;
@@ -24,31 +27,52 @@ const SETTER_BYTES: [u8; 15] = [
 ];
 
 static IMAGE: OnceLock<usize> = OnceLock::new();
+static CLOCK_ON: AtomicBool = AtomicBool::new(false);
+/// The title's cheat functions, read from its table at install.
+static CHEATS: OnceLock<[usize; crate::cheats::COUNT]> = OnceLock::new();
 
 /// Install before any title code runs, while the call site is idle.
+/// `clock`: run the story clock; `cheats`: run the queued title cheats.
+/// Cheats that cannot be verified are left unavailable (a warning, not an error);
+/// the clock keeps its old all-or-nothing behavior.
 ///
 /// # Safety
 /// The caller must keep the image loaded for the duration of title execution.
-pub unsafe fn install(image: &LoadedImage, hash: &str) -> Result<()> {
+pub unsafe fn install(image: &LoadedImage, hash: &str, clock: bool, cheats: bool) -> Result<()> {
     ensure!(
         hash == BUILD,
         "story clock is unavailable for this title build"
     );
-    ensure!(
-        image.info().size_of_image as usize >= CLOCK_FIELDS + 12,
-        "story clock fields are outside the title image"
-    );
     let base = image.base();
     let call = base + UPDATE_CALL;
-    // SAFETY: the supported image covers both checked byte ranges.
-    let matches = unsafe {
-        (call as *const [u8; 10]).read() == CALL_BYTES
-            && ((base + SET_TIME) as *const [u8; 15]).read() == SETTER_BYTES
-    };
+    if clock {
+        ensure!(
+            image.info().size_of_image as usize >= CLOCK_FIELDS + 12,
+            "story clock fields are outside the title image"
+        );
+        // SAFETY: the supported image covers the checked byte range.
+        let setter = unsafe { ((base + SET_TIME) as *const [u8; 15]).read() };
+        ensure!(
+            setter == SETTER_BYTES,
+            "story clock instructions differ from the supported build"
+        );
+    }
+    // SAFETY: the supported image covers the checked byte range.
+    let site = unsafe { (call as *const [u8; 10]).read() };
     ensure!(
-        matches,
-        "story clock instructions differ from the supported build"
+        site == CALL_BYTES,
+        "title tick call site differs from the supported build"
     );
+    let mut table = None;
+    if cheats {
+        match read_table(image) {
+            Ok(t) => table = Some(t),
+            Err(why) => tracing::warn!("title cheats are unavailable: {why}"),
+        }
+    }
+    if !clock && table.is_none() {
+        return Ok(());
+    }
 
     let thunk = near(call).ok_or_else(|| anyhow::anyhow!("no space for the story clock thunk"))?;
     let mut patch =
@@ -60,6 +84,10 @@ pub unsafe fn install(image: &LoadedImage, hash: &str) -> Result<()> {
     IMAGE
         .set(base)
         .map_err(|_| anyhow::anyhow!("story clock was already installed"))?;
+    CLOCK_ON.store(clock, Ordering::Relaxed);
+    if let Some(t) = table {
+        let _ = CHEATS.set(t);
+    }
     let mut protection = 0;
     // SAFETY: the thunk is private to this process and the title has not run.
     unsafe {
@@ -91,8 +119,25 @@ pub unsafe fn install(image: &LoadedImage, hash: &str) -> Result<()> {
             "could not publish the story clock call"
         );
     }
-    tracing::info!("story clock installed; F2 opens the menu once gameplay starts");
+    if table.is_some() {
+        victory_core::cheats::set_ready(true);
+    }
+    tracing::info!(clock, cheats = table.is_some(), "title tick installed; F10 opens the menu once gameplay starts");
     Ok(())
+}
+
+/// The cheat table, checked: it lies in the image and every entry points into executable code.
+fn read_table(image: &LoadedImage) -> Result<[usize; crate::cheats::COUNT]> {
+    let size = image.info().size_of_image as usize;
+    ensure!(
+        size >= crate::cheats::TABLE + crate::cheats::COUNT * 8 && size > crate::cheats::PLAYER + 8,
+        "the cheat table is outside the title image"
+    );
+    // SAFETY: the table lies inside the mapped, relocated image (checked above).
+    let entries = unsafe { ((image.base() + crate::cheats::TABLE) as *const [usize; crate::cheats::COUNT]).read() };
+    let exec = crate::cheats::executable_ranges(&image.info().sections);
+    crate::cheats::validate(&entries, image.base(), &exec).map_err(|why| anyhow::anyhow!(why))?;
+    Ok(entries)
 }
 
 // Read only on the title's clock thread. A separate atomic snapshot serves the menu.
@@ -113,6 +158,38 @@ extern "system" fn update_clock() {
     let Some(&base) = IMAGE.get() else { return };
     // SAFETY: the expected call site targets a zero-argument clock update.
     let update: extern "system" fn() = unsafe { std::mem::transmute(base + UPDATE) };
+    if CLOCK_ON.load(Ordering::Relaxed) {
+        tick_clock(base, update);
+    } else {
+        update();
+    }
+    if let Some(table) = CHEATS.get() {
+        run_cheats(base, table);
+    }
+}
+
+fn run_cheats(base: usize, table: &[usize; crate::cheats::COUNT]) {
+    // SAFETY: the player pointer global lies inside the checked image.
+    let player = unsafe { ((base + crate::cheats::PLAYER) as *const usize).read_volatile() };
+    if player == 0 {
+        // No player in the world: a press now would run title code on nothing.
+        let mut dropped = 0;
+        victory_core::cheats::drain(|_| dropped += 1);
+        if dropped > 0 {
+            tracing::warn!(dropped, "title cheat dropped: no player yet");
+        }
+        return;
+    }
+    victory_core::cheats::drain(|n| {
+        // SAFETY: each entry was verified to point into executable title code
+        // and takes no arguments; this is the title's own game thread.
+        let cheat: extern "system" fn() = unsafe { std::mem::transmute(table[usize::from(n)]) };
+        cheat();
+        tracing::info!(cheat = n, "title cheat run");
+    });
+}
+
+fn tick_clock(base: usize, update: extern "system" fn()) {
     let before = unsafe { read_clock(base) };
     update();
     let after = unsafe { read_clock(base) };

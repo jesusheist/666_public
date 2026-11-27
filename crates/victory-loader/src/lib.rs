@@ -22,6 +22,8 @@
 //!    on, pass every thread start and end on to the attached images.
 
 #[cfg(windows)]
+mod cheats;
+#[cfg(windows)]
 mod console_insn;
 mod crash;
 pub mod frame_rate;
