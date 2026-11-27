@@ -1185,7 +1185,7 @@ pub(crate) mod tests {
         // Part of the cheats plugged in, so the page shows both looks.
         cheats::register_clock(|| Some((14, 0)), |_, _| true);
         let mut text = Text::new().unwrap();
-        let dir = std::path::Path::new(r"D:\.devops\.temp\sxo-port");
+        let dir = &std::env::var_os("VICTORY_PREVIEW_DIR").map(std::path::PathBuf::from).unwrap_or_else(|| std::env::temp_dir().join("victory-previews"));
         std::fs::create_dir_all(dir).unwrap();
         let (bw, bh) = (1920usize, 1080usize);
         let scale = 1.0;

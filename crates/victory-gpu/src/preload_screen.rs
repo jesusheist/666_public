@@ -313,7 +313,7 @@ mod tests {
         assert_eq!(pic[..16], blank[..16]);
     }
 
-    /// The preview of the screen (see `.temp\sxo-port`): stored, not compressed.
+    /// The preview of the screen (written to VICTORY_PRELOAD_PREVIEW_DIR when set): stored, not compressed.
     #[test]
     fn saves_the_preview_pictures() {
         let Some(dir) = std::env::var_os("VICTORY_PRELOAD_PREVIEW_DIR") else { return };

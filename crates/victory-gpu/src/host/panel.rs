@@ -687,7 +687,7 @@ mod tests {
     #[test]
     fn the_preview_is_saved() {
         let mut text = Text::new().unwrap();
-        let dir = std::path::Path::new(r"D:\.devops\.temp\cool_fox\live");
+        let dir = &std::env::var_os("VICTORY_PREVIEW_DIR").map(std::path::PathBuf::from).unwrap_or_else(|| std::env::temp_dir().join("victory-previews"));
         std::fs::create_dir_all(dir).unwrap();
         let v = sample();
         let save = |text: &mut Text, name: &str, (bw, bh): (usize, usize), lines: Lines, corner: &str, size_text: &str| {

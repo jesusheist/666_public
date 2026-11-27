@@ -2035,7 +2035,7 @@ pub(crate) mod tests {
             results.push((opacity, rgb, top as usize));
         }
 
-        let dir = std::path::Path::new(r"D:\.devops\.temp\cool_fox\live");
+        let dir = &std::env::var_os("VICTORY_PREVIEW_DIR").map(std::path::PathBuf::from).unwrap_or_else(|| std::env::temp_dir().join("victory-previews"));
         std::fs::create_dir_all(dir).unwrap();
         std::fs::write(dir.join("menu4-gpu-glass.png"), victory_mcp::shot::encode_png(bw, bh, &results[0].1).unwrap()).unwrap();
         std::fs::write(dir.join("menu4-gpu-glass-half-faded.png"), victory_mcp::shot::encode_png(bw, bh, &results[1].1).unwrap()).unwrap();
