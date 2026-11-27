@@ -44,6 +44,8 @@ mod heap_marks;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
+mod badpix;
+#[cfg(windows)]
 mod logstats;
 #[cfg(windows)]
 mod mcp_shot;

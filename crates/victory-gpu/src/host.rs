@@ -5824,6 +5824,7 @@ impl Host {
         }
         stage.next("submit: the lists' steps");
         for list in runs {
+            crate::badpix::submitted(list);
             list.run_deferred(&mut batch, &air, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
             firsts.push(lists.len());
             // (None unless `VICTORY_PRELUDE_UPLOADS=1`.)
@@ -6687,6 +6688,15 @@ impl HostList {
     pub(crate) fn has_recorded_work(&self) -> bool {
         !self.deferred().copies.is_empty()
             || !self.states.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+    }
+
+    /// The host state this list has title texture `resource`'s host copy in
+    /// where it is recorded now; `None` if the list has not used it yet
+    /// (the bad-pixel scan, `crate::badpix`, puts it back to where it was).
+    pub(crate) fn texture_state(&self, resource: crate::object::This) -> Option<u32> {
+        let copy = crate::resource::host_copy(resource)?;
+        let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        states.get(&(std::sync::Arc::as_ptr(&copy) as usize)).map(|s| s.1)
     }
 
     /// Moves a title texture's host copy to `wanted` (a host state) in this
@@ -9907,10 +9917,26 @@ impl Host {
             // The debug server's screenshot (VICTORY_MCP): one relaxed load a
             // frame when none is asked for, and none at all when it is off.
             let shot = victory_mcp::take_shot_request();
+            // The bad-pixel capture (`find_bad_pixels`) begins and ends at
+            // presents; its end reads the results back at once. One relaxed
+            // load a frame when none is asked for.
+            let mut scan_edge = victory_mcp::scan_edge();
+            // The title's lists are translated ahead of the present (and
+            // submitted after it), so the scans of the frame are read back
+            // at the first present from which every list holding one has
+            // been given to the card, not at the frame's own end.
+            if matches!(scan_edge, Some(victory_mcp::ScanEdge::End)) {
+                crate::badpix::stop_recording();
+                scan_edge = None;
+            }
+            if scan_edge.is_none() && crate::badpix::due() {
+                scan_edge = Some(victory_mcp::ScanEdge::End);
+            }
+            let scan_ends = matches!(scan_edge, Some(victory_mcp::ScanEdge::End));
             #[cfg(feature = "diagnostics")]
-            let read_now = crate::capture::wanted(frame) || crate::capture::listed(frame) || shot.is_some();
+            let read_now = crate::capture::wanted(frame) || crate::capture::listed(frame) || shot.is_some() || scan_ends;
             #[cfg(not(feature = "diagnostics"))]
-            let read_now = shot.is_some();
+            let read_now = shot.is_some() || scan_ends;
             let slot = if late_free_present() && !read_now {
                 let finished = FINISHED.load(Ordering::Acquire);
                 p.ahead.iter().position(|(_, flown)| *flown <= finished).or_else(|| {
@@ -10019,6 +10045,7 @@ impl Host {
                 }
                 crate::mcp_shot::record(&self.device, list, texture, request)
             });
+            let scan = scan_edge.and_then(|edge| crate::badpix::present(&self.device, list, edge, (width, height)));
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
                 .then(|| {
@@ -10086,6 +10113,9 @@ impl Host {
             };
             // The copy has run (a screenshot's present is never sent ahead).
             if let Some(pending) = shot {
+                pending.deliver(frame);
+            }
+            if let Some(pending) = scan {
                 pending.deliver(frame);
             }
             #[cfg(feature = "diagnostics")]

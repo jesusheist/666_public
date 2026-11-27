@@ -3718,6 +3718,7 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
+        let scanned = self.scan_begin(list, "dispatch", true);
         if !self.bind(list, p, true) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
@@ -3725,6 +3726,7 @@ impl State {
             if crate::pipeline::is_builder(self.pipeline as This) {
                 crate::pipeline::builder_rests("one of its dispatches could not be bound");
             }
+            self.scan_end(list, scanned, false);
             return;
         }
         #[cfg(feature = "diagnostics")]
@@ -3762,6 +3764,7 @@ impl State {
             self.host_pipeline = 0;
             self.host_roots[1] = 0;
         }
+        self.scan_end(list, scanned, true);
     }
 
     /// The stand-in for the indirect light after a dispatch of `p`
@@ -4278,6 +4281,7 @@ impl State {
         self.window = None;
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
+        let scanned = self.scan_begin(list, "mesh", false);
         let ran = mesh_test() != 1
             && mesh_kept(self.pipeline)
             && self.prepare_for(list, false, true)
@@ -4309,6 +4313,7 @@ impl State {
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
+        self.scan_end(list, scanned, ran);
     }
 
     /// The walls trace (`crate::host::walls_trace`): one log line per
@@ -4762,6 +4767,7 @@ impl State {
         if crate::streamline::hudless_wanted() {
             self.before_shown_target(list, vertices == 3 && instances == 1);
         }
+        let scanned = self.scan_begin(list, "draw", false);
         let ready = self.prepare(list, false);
         // A pipeline with the rectangle geometry stage draws the title's
         // vertices as they are; any other gets its rectangles expanded.
@@ -4796,6 +4802,7 @@ impl State {
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
+        self.scan_end(list, scanned, ran);
     }
 
     /// With frame generation (`crate::streamline`), before a draw into one
@@ -4968,6 +4975,7 @@ impl State {
         if lost {
             once!("indexed rectangles not drawn");
         }
+        let scanned = self.scan_begin(list, "indexed", false);
         let ran = !lost && self.prepare(list, true);
         if ran {
             #[cfg(feature = "diagnostics")]
@@ -4985,6 +4993,129 @@ impl State {
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
+        self.scan_end(list, scanned, ran);
+    }
+}
+
+impl State {
+    /// `find_bad_pixels` (`VICTORY_MCP`): while a capture records, plans the
+    /// scans of what the command about to be recorded writes and records
+    /// the scans before it. One relaxed load when no capture is asked for.
+    /// Called before the command's own state is set on the list: the scans
+    /// bind a compute pipeline and root signature of their own.
+    #[inline]
+    fn scan_begin(&mut self, list: &HostList, kind: &'static str, compute: bool) -> Option<crate::badpix::Ticket> {
+        if !crate::badpix::recording() {
+            return None;
+        }
+        self.scan_begin_recording(list, kind, compute)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn scan_begin_recording(&mut self, list: &HostList, kind: &'static str, compute: bool) -> Option<crate::badpix::Ticket> {
+        let sources = self.scan_sources(compute, crate::badpix::wants_uav());
+        if sources.is_empty() {
+            return None;
+        }
+        let pipeline = crate::pipeline::host_pipeline(self.pipeline as This);
+        let ticket = crate::badpix::begin(list, kind, pipeline, &sources);
+        if ticket.is_some() {
+            // The scans set a pipeline and root signature of their own.
+            self.host_pipeline = 0;
+            self.host_roots = [0; 2];
+        }
+        ticket
+    }
+
+    /// The scans after the command (`ran`: it was recorded).
+    #[inline]
+    fn scan_end(&mut self, list: &HostList, ticket: Option<crate::badpix::Ticket>, ran: bool) {
+        if let Some(ticket) = ticket {
+            self.scan_end_recording(list, ticket, ran);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn scan_end_recording(&mut self, list: &HostList, ticket: crate::badpix::Ticket, ran: bool) {
+        if ran {
+            crate::badpix::end(list, ticket);
+        } else {
+            crate::badpix::dropped(ticket);
+        }
+        self.host_pipeline = 0;
+        self.host_roots = [0; 2];
+    }
+
+    /// The textures a graphics command writes as render targets, and with
+    /// `uav` the ones its shaders may write through unordered access views
+    /// in descriptor tables (the views the tables name for the shaders'
+    /// used resources).
+    fn scan_sources(&self, compute: bool, uav: bool) -> Vec<crate::badpix::Source> {
+        let mut out = Vec::new();
+        if !compute {
+            for (i, &handle) in self.target_handles.iter().enumerate() {
+                let Some(record) = crate::descriptor::rtv_record(handle) else { continue };
+                let Some(host) = crate::resource::host_resource(record.resource) else { continue };
+                // SAFETY: a live resource.
+                let mips = u32::from(unsafe { host.GetDesc() }.MipLevels.max(1));
+                let (format, subresource) = match record.desc() {
+                    Some(d) => {
+                        // SAFETY: the union member read is the one the dimension names.
+                        let sub = unsafe {
+                            match d.ViewDimension {
+                                D3D12_RTV_DIMENSION_TEXTURE2D => d.Anonymous.Texture2D.MipSlice,
+                                D3D12_RTV_DIMENSION_TEXTURE2DARRAY => {
+                                    d.Anonymous.Texture2DArray.MipSlice + d.Anonymous.Texture2DArray.FirstArraySlice * mips
+                                }
+                                _ => 0,
+                            }
+                        };
+                        (d.Format.0 as u32, sub)
+                    }
+                    None => (0, 0),
+                };
+                out.push(crate::badpix::Source { resource: record.resource as usize, role: format!("rt{i}"), view_format: format, subresource });
+            }
+        }
+        if !uav {
+            return out;
+        }
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else { return out };
+        for stage in &p.stages {
+            for u in &stage.translated().used {
+                if u.kind != ResourceType::Uav || u.root != RootType::Table {
+                    continue;
+                }
+                let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else { continue };
+                let Some(View::Unordered(resource, _, desc)) = crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4) else {
+                    continue;
+                };
+                let Some(host) = crate::resource::host_resource(resource as This) else { continue };
+                // SAFETY: a live resource.
+                let mips = u32::from(unsafe { host.GetDesc() }.MipLevels.max(1));
+                // The description's words: format, dimension, then the
+                // dimension's (2D: mip slice; 2D array: mip slice, first slice).
+                let (format, subresource) = match desc {
+                    Some(w) => {
+                        let format = crate::resource::target_format(crate::resource::pc_format(w[0]));
+                        let sub = match w[1] {
+                            4 => w[2],
+                            5 => w[2] + w[3] * mips,
+                            _ => 0,
+                        };
+                        (format, sub)
+                    }
+                    None => (0, 0),
+                };
+                if out.iter().any(|o| o.resource == resource && o.subresource == subresource) {
+                    continue;
+                }
+                out.push(crate::badpix::Source { resource, role: format!("uav s{}+{}", u.slot, u.table_offset_dwords), view_format: format, subresource });
+            }
+        }
+        out
     }
 }
 
