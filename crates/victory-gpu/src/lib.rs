@@ -58,6 +58,7 @@ mod menu_env;
 #[cfg(windows)]
 pub use menu::preload_screen;
 pub mod cheats;
+mod shvi;
 /// The F1 settings menu is shown (`host/menu.rs`): the title gets no keyboard meanwhile
 /// (read by the input module).
 pub static SETTINGS_MENU_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

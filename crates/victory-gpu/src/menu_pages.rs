@@ -37,6 +37,7 @@ use victory_core::tunables::{self as reg, Kind as RegKind, Live, Slot};
 use super::live;
 use super::{ACCENT, Action, Canvas, Readouts, TEXT, TEXT_DIM, TEXT_SOFT, Tab, Text, WARM, WHITE, bar, chrome, gb, paint_selected, rule, scrollbar};
 use crate::cheats::{self, Id};
+use crate::shvi;
 use crate::tunables::known as k;
 use crate::menu_env;
 
@@ -54,6 +55,10 @@ pub(crate) enum Src {
     PanelShown,
     /// An entry of the cheats registry.
     Cheat(Id),
+    /// A ScriptHook cheat (run on the game thread by `shvi`).
+    Shvi(shvi::Fid),
+    /// A line of text that is not a setting (a section's title, a missing-ScriptHook message).
+    Note,
 }
 
 /// A line: its label, where its value lives and the values it goes through
@@ -175,9 +180,18 @@ fn cheat_desc(id: Id) -> &'static str {
     }
 }
 
-/// The Cheats list: every entry of the registry.
+/// The Cheats list: every entry of the registry, then the SCRIPTHOOK section (or the one line saying it is not loaded).
 pub(crate) fn cheats_items() -> Vec<Item> {
-    cheats::CHEATS.iter().map(|c| Item { label: c.name, src: Src::Cheat(c.id), values: &[], desc: cheat_desc(c.id) }).collect()
+    let mut items: Vec<Item> = cheats::CHEATS.iter().map(|c| Item { label: c.name, src: Src::Cheat(c.id), values: &[], desc: cheat_desc(c.id) }).collect();
+    match shvi::lines() {
+        None => items.push(Item { label: "SCRIPTHOOK NOT LOADED (VICTORY_LOAD_DLLS)", src: Src::Note, values: &[], desc: "ScriptHook VI's core is not loaded: add its shvi_core.dll to VICTORY_LOAD_DLLS to get its cheats here." }),
+        Some(list) if list.is_empty() => items.push(Item { label: "SCRIPTHOOK LOADED, NO NATIVES BOUND", src: Src::Note, values: &[], desc: "ScriptHook VI is loaded but the game build has no native table for it (shvi\natives)." }),
+        Some(list) => {
+            items.push(Item { label: "SCRIPTHOOK", src: Src::Note, values: &[], desc: "Cheats that call ScriptHook VI natives. A press waits for the game's next frame." });
+            items.extend(list.iter().map(|f| Item { label: f.label, src: Src::Shvi(f.fid), values: &[], desc: f.desc }));
+        }
+    }
+    items
 }
 
 /// Whether two texts are the same value of a kind (numbers by their value, so "1" is "1.0").
@@ -363,13 +377,15 @@ impl Curated {
             }
             Src::PanelShown => crate::host::stats_panel_shown().to_string(),
             Src::Cheat(id) => cheats::value_text(id),
+            Src::Shvi(fid) => shvi::value_text(fid),
+            Src::Note => String::new(),
         }
     }
 
     fn kind_of(item: &Item) -> RegKind {
         match item.src {
             Src::Slot(s) => s.meta().kind,
-            Src::Env(_) | Src::PanelShown | Src::Cheat(_) => RegKind::Bool,
+            Src::Env(_) | Src::PanelShown | Src::Cheat(_) | Src::Shvi(_) | Src::Note => RegKind::Bool,
         }
     }
 
@@ -379,6 +395,8 @@ impl Curated {
             Src::Env(_) => item.values.first().is_some_and(|(first, _)| !same(RegKind::Bool, first, &Self::value_text(item))),
             Src::PanelShown => crate::host::stats_panel_shown(),
             Src::Cheat(id) => cheats::is_on(id),
+            Src::Shvi(fid) => shvi::is_changed(fid),
+            Src::Note => false,
         }
     }
 
@@ -453,6 +471,12 @@ impl Curated {
                     why.clone_into(&mut self.note);
                 }
             }
+            Src::Shvi(fid) => {
+                if let Err(why) = shvi::step(fid, dir) {
+                    why.clone_into(&mut self.note);
+                }
+            }
+            Src::Note => {}
             Src::Slot(slot) => {
                 let current = Self::value_text(&self.items[at]);
                 if let Some(text) = step_value(slot.meta().kind, values, &current, dir)
@@ -485,6 +509,8 @@ impl Curated {
                 let _ = k::PANEL.set(false);
             }
             Src::Cheat(id) => cheats::reset(id),
+            Src::Shvi(fid) => shvi::reset(fid),
+            Src::Note => {}
         }
     }
 
@@ -552,6 +578,17 @@ impl Curated {
         false
     }
 
+    /// The line under the list: what the last key said, else, on a ScriptHook line, what the game thread did with its last request.
+    fn note_now(&self, selected: usize) -> String {
+        if !self.note.is_empty() {
+            return self.note.clone();
+        }
+        match self.items.get(selected) {
+            Some(item) if matches!(item.src, Src::Shvi(_)) => Some(shvi::status()).filter(|s| s.starts_with(item.label)).unwrap_or_default(),
+            _ => String::new(),
+        }
+    }
+
     /// What to paint now; `fps` and `ms` are the frame rate and frame time.
     pub(crate) fn view(&self, fps: f32, ms: f32) -> PView {
         let n = self.items.len();
@@ -590,6 +627,14 @@ impl Curated {
                         line.note = cheats::cheat(id).note.to_owned();
                     }
                 }
+                Src::Shvi(fid) => {
+                    line.value = shvi::value_text(fid);
+                    line.default = if matches!(shvi::feature_of(fid).kind, shvi::Kind::Toggle) { "OFF".to_owned() } else { String::new() };
+                }
+                Src::Note => {
+                    line.plain = true;
+                    line.dim = item.label != "SCRIPTHOOK";
+                }
             }
             line.restart = Self::restart_class(item);
             line.changed = Self::is_changed(item);
@@ -603,14 +648,19 @@ impl Curated {
                 Src::Slot(s) => (format!("{} ({})", item.desc, when(s.meta().live)), s.meta().env.to_owned()),
                 Src::Env(var) => (format!("{} ({})", item.desc, if menu_env::live(var) { "applies at once" } else { "needs a restart" }), var.to_owned()),
                 Src::Cheat(id) if !cheats::available(id) => (format!("{} Not available yet: {}.", item.desc, cheats::cheat(id).note), String::new()),
-                Src::Cheat(_) => (format!("{} (applies at once)", item.desc), String::new()),
+                Src::Cheat(_) | Src::Shvi(_) => (format!("{} (applies at once)", item.desc), String::new()),
+                Src::Note => (item.desc.to_owned(), String::new()),
                 _ => (format!("{} (applies at once)", item.desc), String::new()),
             }
         };
         let changed_all = self.items.iter().filter(|i| Self::is_changed(i)).count();
         let tally = match self.tab {
             Tab::Home => String::new(),
-            Tab::Cheats => format!("{} of {} available", cheats::available_count(), n),
+            Tab::Cheats => {
+                let hook = self.items.iter().filter(|i| matches!(i.src, Src::Shvi(_))).count();
+                let own = cheats::CHEATS.len();
+                if hook == 0 { format!("{} of {} available", cheats::available_count(), own) } else { format!("{} of {} available +{}", cheats::available_count(), own, hook) }
+            }
             _ if changed_all == 0 => format!("none changed, {n} lines"),
             _ => format!("{changed_all} changed of {n} lines"),
         };
@@ -621,7 +671,7 @@ impl Curated {
             scroll,
             desc,
             env,
-            note: self.note.clone(),
+            note: self.note_now(selected),
             tally,
             changed_all,
             total: n,
@@ -1005,11 +1055,62 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn the_scripthook_section_lists_what_is_bound_and_a_press_queues_it() {
+        let _turn = cheats::test_turn();
+        let _hook = shvi::test_host::turn();
+        shvi::test_host::reset_state();
+        shvi::test_host::set(Some(shvi::COUNT));
+        let mut page = Curated::new(Tab::Cheats);
+        let own = cheats::CHEATS.len();
+        assert_eq!(page.rows(), own + 1 + shvi::COUNT);
+        assert_eq!(page.items[own].label, "SCRIPTHOOK");
+        assert!(matches!(page.items[own].src, Src::Note));
+        assert_eq!(page.items[own + 1].label, "GOD MODE");
+        let v = page.view(0.0, 0.0);
+        assert_eq!(v.tally, format!("0 of {own} available +{}", shvi::COUNT));
+        // The section's line is on the last page of rows: move there and press.
+        for _ in 0..=own {
+            page.step(Action::Down);
+        }
+        let v = page.view(0.0, 0.0);
+        assert!(v.lines.iter().find(|l| l.selected).is_some_and(|l| l.label == "GOD MODE" && l.value == "OFF" && !l.dim));
+        page.step(Action::Enter);
+        let v = page.view(0.0, 0.0);
+        assert_eq!(v.lines.iter().find(|l| l.selected).unwrap().value, "ON");
+        assert!(v.desc.contains("applies at once"));
+        // The title line of the section does nothing.
+        page.selected = own;
+        page.step(Action::Enter);
+        assert!(page.note.is_empty());
+        // Fewer natives bound: fewer lines, no dead ones.
+        shvi::test_host::set(Some(3));
+        assert_eq!(Curated::new(Tab::Cheats).rows(), own + 1 + 3);
+        // Loaded with nothing bound: one line saying so.
+        shvi::test_host::set(Some(0));
+        let none = Curated::new(Tab::Cheats);
+        assert_eq!(none.rows(), own + 1);
+        assert_eq!(none.items[own].label, "SCRIPTHOOK LOADED, NO NATIVES BOUND");
+        // Resetting the page switches the toggle off.
+        shvi::test_host::set(Some(shvi::COUNT));
+        assert!(shvi::is_changed(shvi::Fid::God));
+        page.selected = own + 1;
+        page.reset_selected();
+        assert!(!shvi::is_changed(shvi::Fid::God));
+        shvi::test_host::reset_state();
+        shvi::test_host::set(None);
+    }
+
+    #[test]
     fn the_cheats_page_is_dim_with_notes_until_something_is_plugged_in() {
         let _turn = cheats::test_turn();
+        let _hook = shvi::test_host::turn();
+        shvi::test_host::set(None);
         cheats::clear();
         let mut page = Curated::new(Tab::Cheats);
-        assert_eq!(page.rows(), 19);
+        // The 19 entries and the one line saying ScriptHook is not loaded.
+        assert_eq!(page.rows(), 20);
+        assert_eq!(page.items[19].label, "SCRIPTHOOK NOT LOADED (VICTORY_LOAD_DLLS)");
+        assert!(!page.items.iter().any(|i| matches!(i.src, Src::Shvi(_))));
         let v = page.view(0.0, 0.0);
         assert_eq!(v.tally, "0 of 19 available");
         assert!(v.lines.iter().all(|l| l.dim && !l.action && !l.restart));
@@ -1078,6 +1179,8 @@ pub(crate) mod tests {
     fn the_previews_are_saved() {
         use super::super::tests::backdrop;
         let _turn = cheats::test_turn();
+        let _hook = shvi::test_host::turn();
+        shvi::test_host::set(None);
         cheats::clear();
         // Part of the cheats plugged in, so the page shows both looks.
         cheats::register_clock(|| Some((14, 0)), |_, _| true);
@@ -1109,6 +1212,26 @@ pub(crate) mod tests {
                 v.mem = Some(readouts);
             }
             save(name, &paint(&mut text, &v, scale));
+        }
+        // The CHEATS page with ScriptHook loaded: scrolled to its section, two lines changed.
+        {
+            shvi::test_host::set(Some(shvi::COUNT));
+            let mut page = Curated::new(Tab::Cheats);
+            let first = cheats::CHEATS.len();
+            page.selected = first + 1;
+            page.step(Action::Right);
+            page.selected = first + 4;
+            page.step(Action::Right);
+            page.selected = first + 10;
+            page.step(Action::Right);
+            page.selected = first + 6;
+            page.scroll = first - 1;
+            page.note = String::new();
+            let v = page.view(readouts.fps, readouts.frame_ms);
+            save("cheats-scripthook", &paint(&mut text, &v, scale));
+            std::fs::copy(dir.join("menu-cheats-scripthook.png"), dir.join("cheats-page.png")).unwrap();
+            shvi::test_host::reset_state();
+            shvi::test_host::set(None);
         }
         // The Controls page: a line being rebound, a changed line, and the note of a key taken from another action.
         {
