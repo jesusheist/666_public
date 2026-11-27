@@ -62,6 +62,8 @@ mod live;
 mod controls;
 #[path = "menu_pages.rs"]
 mod pages;
+#[path = "preload_screen.rs"]
+pub mod preload_screen;
 
 /// The menu's title.
 pub(crate) const TITLE: &str = "JESUS666 MENU";

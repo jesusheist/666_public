@@ -55,6 +55,8 @@ pub use host::menu_key_down;
 mod menu;
 #[cfg(windows)]
 mod menu_env;
+#[cfg(windows)]
+pub use menu::preload_screen;
 pub mod cheats;
 /// The F1 settings menu is shown (`host/menu.rs`): the title gets no keyboard meanwhile
 /// (read by the input module).

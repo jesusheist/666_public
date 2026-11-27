@@ -695,7 +695,7 @@ pub(crate) fn paint(text: &mut Text, v: &PView, scale: f32) -> Canvas {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// The launcher settings are process-wide: the tests that change them take turns.
@@ -712,7 +712,7 @@ mod tests {
     }
 
     /// A PNG file (stored, not compressed) of an 8-bit RGB picture, for the previews.
-    fn encode_png(w: u32, h: u32, rgb: &[u8]) -> Vec<u8> {
+    pub(crate) fn encode_png(w: u32, h: u32, rgb: &[u8]) -> Vec<u8> {
         fn crc(bytes: &[u8]) -> u32 {
             let mut c = !0u32;
             for &b in bytes {
