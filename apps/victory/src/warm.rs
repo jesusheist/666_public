@@ -21,7 +21,7 @@ const LONGEST: Duration = Duration::from_secs(180);
 /// As the runs count one that takes long.
 const SLOW_MS: f64 = 1000.0;
 
-fn folder() -> Result<PathBuf> {
+pub(crate) fn folder() -> Result<PathBuf> {
     let cfg = victory_core::Config::load()?;
     Ok(cfg.cache_subdir("shaders")?.with_file_name("pipelines"))
 }
@@ -56,6 +56,8 @@ pub struct Plan {
     pub todo: Vec<usize>,
     pub made_before: usize,
     pub bad: usize,
+    /// What the same selection holds with the made ones counted in.
+    pub scope: usize,
 }
 
 /// Reads the cache's lists. Makes the host device (the fingerprint holds the
@@ -68,9 +70,10 @@ pub fn plan(limit: Option<usize>, again: bool, used: bool) -> Result<Plan> {
     let read = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap_or_default();
     let (listed, bad, early) = (read("warm-done.txt"), read("warm-bad.txt"), read("early-pipelines.txt"));
     let todo = victory_core::preload::select_todo(&keys, &listed, &bad, &early, &fingerprint, again, used, limit);
+    let scope = victory_core::preload::select_todo(&keys, &listed, &bad, &early, &fingerprint, true, used, None).len();
     let made_before = victory_core::preload::done_keys(&listed, &fingerprint).len();
     let bad = bad.lines().filter_map(|l| l.split(' ').next()).collect::<HashSet<_>>().len();
-    Ok(Plan { dir, fingerprint, keys, todo, made_before, bad })
+    Ok(Plan { dir, fingerprint, keys, todo, made_before, bad, scope })
 }
 
 pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, these: Option<String>) -> Result<()> {
@@ -83,7 +86,7 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
 /// [`run`] with `options`.
 pub fn run_with(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, options: &Options) -> Result<()> {
     let began = Instant::now();
-    let Plan { dir, fingerprint, keys, todo: all, made_before, bad } = plan(limit, again, used)?;
+    let Plan { dir, fingerprint, keys, todo: all, made_before, bad, .. } = plan(limit, again, used)?;
     let done_file = dir.join("warm-done.txt");
     let bad_file = dir.join("warm-bad.txt");
     let cores = std::thread::available_parallelism().map_or(4, |n| n.get());

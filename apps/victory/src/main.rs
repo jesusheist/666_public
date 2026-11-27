@@ -7,6 +7,8 @@ mod census;
 mod inspect;
 #[cfg(windows)]
 mod play;
+#[cfg(windows)]
+mod preload;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod replay;
 mod run;
@@ -129,6 +131,11 @@ enum Command {
         #[arg(long, hide = true)]
         these: Option<String>,
     },
+    /// Make the shaders and host pipelines before the title starts, with the
+    /// preload screen (`play` does it by itself when the cache is not complete;
+    /// see `VICTORY_PRELOAD`). With `--check`: only say what is ready.
+    #[cfg(windows)]
+    Preload(preload::Args),
     /// Play: the title with this fork's settings, as a start with no
     /// command at all does (a double click on the program beside the
     /// title's `game_scarlett_master.exe`). F1 in the game is the settings
@@ -216,6 +223,10 @@ fn main() -> Result<()> {
         let done = play::prepare(options).and_then(|ready| {
             victory_core::logging::init("info");
             victory_core::tunables::init();
+            // The preload screen, when the cache is not complete (its window closed: end).
+            if !preload::start(&ready.exe, options.preload) {
+                return Ok(());
+            }
             let console = if ready.series_s { Console::SeriesS } else { Console::SeriesX };
             run::run(&ready.exe, Unimplemented::Trap, false, true, console)
         });
@@ -270,6 +281,8 @@ fn main() -> Result<()> {
         Command::Shaders { paths, jobs } => translate::precompile(paths, jobs),
         #[cfg(windows)]
         Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
+        #[cfg(windows)]
+        Command::Preload(args) => preload::run(args),
         #[cfg(windows)]
         Command::Play(_) => unreachable!("handled above"),
         #[cfg(windows)]

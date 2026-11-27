@@ -122,6 +122,10 @@ pub(crate) struct Play {
     /// Frames a second at most (30: the title's own rate; 1000: no cap).
     #[arg(long, default_value_t = 1000, value_parser = clap::value_parser!(u32).range(1..=1000))]
     fps: u32,
+    /// Show the preload screen even when the cache is complete (the menu's
+    /// PRELOAD NOW starts this way).
+    #[arg(long)]
+    pub(crate) preload: bool,
     /// Add or override a switch, as often as needed: `--set VICTORY_X=1`.
     #[arg(long = "set", value_name = "NAME=VALUE")]
     more: Vec<String>,
@@ -448,6 +452,7 @@ mod tests {
             framegen: None,
             no_framegen_ready: false,
             fps: 1000,
+            preload: false,
             more: Vec::new(),
         }
     }
