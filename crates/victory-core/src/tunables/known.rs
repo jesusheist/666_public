@@ -15,13 +15,37 @@
 //! are not declared: the registry holds numbers, on/off and fixed choices.
 
 mod menu;
+mod switches_1;
+mod switches_2;
+mod switches_3;
+mod switches_4;
+mod switches_5;
+mod switches_6;
 
 #[allow(unused_imports)]
 pub use menu::*;
+#[allow(unused_imports)]
+pub use switches_1::*;
+#[allow(unused_imports)]
+pub use switches_2::*;
+#[allow(unused_imports)]
+pub use switches_3::*;
+#[allow(unused_imports)]
+pub use switches_4::*;
+#[allow(unused_imports)]
+pub use switches_5::*;
+#[allow(unused_imports)]
+pub use switches_6::*;
 
 /// Registers every area's tunables.
 pub fn register_all() {
     menu::register();
+    switches_1::register();
+    switches_2::register();
+    switches_3::register();
+    switches_4::register();
+    switches_5::register();
+    switches_6::register();
 }
 
 /// The switches the runtime's own code reads from the environment: all of them in this fork.

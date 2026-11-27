@@ -215,6 +215,7 @@ fn main() -> Result<()> {
     if let Command::Play(options) = &cli.command {
         let done = play::prepare(options).and_then(|ready| {
             victory_core::logging::init("info");
+            victory_core::tunables::init();
             let console = if ready.series_s { Console::SeriesS } else { Console::SeriesX };
             run::run(&ready.exe, Unimplemented::Trap, false, true, console)
         });
@@ -227,6 +228,7 @@ fn main() -> Result<()> {
         return done;
     }
     victory_core::logging::init("info");
+    victory_core::tunables::init();
     match cli.command {
         Command::Inspect {
             file,
