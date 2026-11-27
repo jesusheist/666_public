@@ -44,5 +44,9 @@ tunable!(pub CARD_BUFFERS_MIN_KB: i64 = 0, 0..=100000000, "VICTORY_CARD_BUFFERS_
     "Least size in KiB of a buffer copied onto the card (0 keeps the built-in minimum)", live = Restart);
 tunable!(pub PORT_CONSTANTS: bool = false, "VICTORY_PORT_CONSTANTS",
     "Constants heap in place", live = Restart);
+tunable!(pub PRELOAD: enum = "ask", ["ask", "always_wait", "off"], "VICTORY_PRELOAD",
+    "Shader preload screen at a start when the cache is not complete: ask (ENTER waits, Esc starts the game), always_wait (waits without asking), off", live = Restart);
+tunable!(pub PRELOAD_BACKGROUND: bool = false, "VICTORY_PRELOAD_BACKGROUND",
+    "Make the rest of the pipelines at idle priority while the game runs (one worker, started a minute in)", live = Restart);
 
-tunable_list!(pub(super) fn register: FPS_LINE, PANEL, FULLSCREEN, MOUSE_CAPTURE, IME_ENGLISH, DLSS_PRESET, AMBIENT, AMBIENT_AIR, BVH_BUILDER, WATER_LIGHT, EARLY_DEPTH, WC_NO_BACK, SOFT_VIEWS, TEXTURE_NO_WAIT, RELAY, CARD_STEPS, INDIRECT_BATCH, CARD_BUFFERS_MIN_KB, PORT_CONSTANTS);
+tunable_list!(pub(super) fn register: FPS_LINE, PANEL, FULLSCREEN, MOUSE_CAPTURE, IME_ENGLISH, DLSS_PRESET, AMBIENT, AMBIENT_AIR, BVH_BUILDER, WATER_LIGHT, EARLY_DEPTH, WC_NO_BACK, SOFT_VIEWS, TEXTURE_NO_WAIT, RELAY, CARD_STEPS, INDIRECT_BATCH, CARD_BUFFERS_MIN_KB, PORT_CONSTANTS, PRELOAD, PRELOAD_BACKGROUND);

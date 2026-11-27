@@ -146,12 +146,17 @@ pub(crate) fn reset(vars: &[(&'static str, &'static str)]) {
 /// Starts the launcher again in a new console, a few seconds on, and ends this run. Returns
 /// only when it could not, with what to tell.
 pub(crate) fn restart() -> Option<String> {
+    restart_with("")
+}
+
+/// [`restart`] with `extra` after the arguments (" --preload": the start shows the preload screen).
+pub(crate) fn restart_with(extra: &str) -> Option<String> {
     use std::os::windows::process::CommandExt;
     let Some(play) = std::env::var_os("VICTORY_MENU_PLAY") else {
         return Some("Saved: start the launcher again yourself".to_owned());
     };
     let play = play.to_string_lossy().replace('\'', "''");
-    let args = env("VICTORY_MENU_ARGS");
+    let args = format!("{}{extra}", env("VICTORY_MENU_ARGS"));
     let command = format!("Start-Sleep 3; & '{play}' {args}");
     const CREATE_NEW_CONSOLE: u32 = 0x10;
     match std::process::Command::new("powershell.exe")

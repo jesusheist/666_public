@@ -158,11 +158,16 @@ pub(crate) const ROWS: usize = 12;
 
 /// The first line shown so that `selected` is, moving as little as it can.
 pub(crate) fn follow(selected: usize, scroll: usize, total: usize) -> usize {
-    let most = total.saturating_sub(ROWS);
+    follow_in(selected, scroll, total, ROWS)
+}
+
+/// [`follow`] for a list that shows `visible` lines.
+pub(crate) fn follow_in(selected: usize, scroll: usize, total: usize, visible: usize) -> usize {
+    let most = total.saturating_sub(visible);
     let scroll = if selected < scroll {
         selected
-    } else if selected >= scroll + ROWS {
-        selected + 1 - ROWS
+    } else if selected >= scroll + visible {
+        selected + 1 - visible
     } else {
         scroll
     };

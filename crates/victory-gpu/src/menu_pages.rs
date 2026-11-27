@@ -95,6 +95,7 @@ pub(crate) fn home_items() -> Vec<Item> {
         env_item("FULLSCREEN (NO BORDER)", "VICTORY_FULLSCREEN", UNSET_ON, "A borderless window over the whole screen."),
         env_item("MOUSE CAPTURE", "VICTORY_MOUSE_CAPTURE", UNSET_ON, "Hides and holds the mouse cursor while the window has the focus."),
         env_item("ENGLISH KEYBOARD", "VICTORY_IME_ENGLISH", UNSET_ON, "Forces the English keyboard layout for the game window."),
+        slot_item("PRELOAD SHADERS", k::PRELOAD.slot(), &[("ask", "ASK"), ("always_wait", "ALWAYS WAIT"), ("off", "OFF")]),
     ]
 }
 
@@ -226,14 +227,17 @@ pub(crate) enum Act {
     Save,
     ResetAll,
     Close,
+    /// Home only: save, then start again with the preload screen shown.
+    PreloadNow,
 }
 
 /// The action lines of Graphics and Performance, in order, and what each does.
-pub(crate) const ACTIONS: [(&str, &str); 4] = [
+pub(crate) const ACTIONS: [(&str, &str); 5] = [
     ("SAVE AND RESTART NOW", "Writes the settings to the live settings file, then starts the program again with the same arguments and environment and ends this run. Lines marked R apply."),
     ("SAVE FOR NEXT START", "Writes the settings to the live settings file now. Lines marked R apply at the next start."),
     ("RESET ALL TO PLAY DEFAULTS", "Puts every line of this page back to its play default and forgets it in the live settings file."),
     ("CLOSE", "Closes the menu (Esc or F10 does too)."),
+    ("PRELOAD NOW (RESTART)", "Saves the settings, then starts the program again with the preload screen: the shaders and pipelines are made before the title starts (ENTER waits for it, Esc starts the game and the next start goes on)."),
 ];
 
 /// A line as painted.
@@ -276,6 +280,11 @@ pub(crate) struct PView {
     pub mem: Option<Readouts>,
 }
 
+/// Lines of a page's list shown at once: Home keeps the room under its list for the memory readout.
+pub(crate) fn visible(tab: Tab) -> usize {
+    if tab == Tab::Home { live::ROWS - 2 } else { live::ROWS }
+}
+
 /// One of the pages.
 pub(crate) struct Curated {
     tab: Tab,
@@ -301,8 +310,17 @@ impl Curated {
         Curated { tab, items, actions, selected: 0, scroll: 0, note: String::new() }
     }
 
+    /// Action lines under the items: the Home page has the preload one besides the four.
+    fn action_count(&self) -> usize {
+        match (self.actions, self.tab) {
+            (false, _) => 0,
+            (true, Tab::Home) => ACTIONS.len(),
+            (true, _) => ACTIONS.len() - 1,
+        }
+    }
+
     fn rows(&self) -> usize {
-        self.items.len() + if self.actions { ACTIONS.len() } else { 0 }
+        self.items.len() + self.action_count()
     }
 
     /// What the line `item` holds now, as the value's text (a waiting value counts).
@@ -377,7 +395,7 @@ impl Curated {
             Action::Enter => asked = Some(Self::act_of(self.selected - n)),
             Action::Left | Action::Right | Action::Toggle | Action::Close => {}
         }
-        self.scroll = live::follow(self.selected, self.scroll, total);
+        self.scroll = live::follow_in(self.selected, self.scroll, total, visible(self.tab));
         asked
     }
 
@@ -386,6 +404,7 @@ impl Curated {
             0 => Act::SaveRestart,
             1 => Act::Save,
             2 => Act::ResetAll,
+            4 => Act::PreloadNow,
             _ => Act::Close,
         }
     }
@@ -475,6 +494,20 @@ impl Curated {
                     }
                 }
             }
+            Act::PreloadNow => {
+                let (ok, note) = save_all();
+                self.note = note;
+                if ok {
+                    let failed = if std::env::var_os("VICTORY_MENU_PLAY").is_some() {
+                        menu_env::restart_with(" --preload")
+                    } else {
+                        Some("Saved: the preload runs from the launcher (start it with --preload)".to_owned())
+                    };
+                    if let Some(failed) = failed {
+                        self.note = failed;
+                    }
+                }
+            }
             Act::ResetAll => {
                 let n = self.reset_all();
                 let defaults: Vec<(&'static str, &'static str)> = self
@@ -498,9 +531,10 @@ impl Curated {
         let n = self.items.len();
         let rows = self.rows();
         let selected = self.selected.min(rows.saturating_sub(1));
-        let scroll = self.scroll.min(rows.saturating_sub(live::ROWS));
-        let mut lines = Vec::with_capacity(live::ROWS.min(rows));
-        for at in scroll..rows.min(scroll + live::ROWS) {
+        let shown_rows = visible(self.tab);
+        let scroll = self.scroll.min(rows.saturating_sub(shown_rows));
+        let mut lines = Vec::with_capacity(shown_rows.min(rows));
+        for at in scroll..rows.min(scroll + shown_rows) {
             if at >= n {
                 lines.push(PLine { label: ACTIONS[at - n].0.to_owned(), selected: at == selected, action: true, ..PLine::default() });
                 continue;
@@ -662,7 +696,8 @@ pub(crate) fn paint(text: &mut Text, v: &PView, scale: f32) -> Canvas {
             put(text, &mut c, "R", mark_right, small, col, true, true);
         }
     }
-    scrollbar(&mut c, scale, (w - u(11.0), top + u(6.0), row_h * live::ROWS as f32 - u(12.0)), v.rows, live::ROWS, v.scroll);
+    let shown_rows = visible(v.tab);
+    scrollbar(&mut c, scale, (w - u(11.0), top + u(6.0), row_h * shown_rows as f32 - u(12.0)), v.rows, shown_rows, v.scroll);
     if let Some(r) = &v.mem {
         paint_readouts(text, &mut c, scale, (left, top + row_h * v.lines.len() as f32 + u(10.0), width), r);
     }
@@ -787,12 +822,31 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn home_has_the_preload_switch_and_the_preload_now_line_and_the_others_do_not() {
+        let items = home_items();
+        assert_eq!(items.last().unwrap().label, "PRELOAD SHADERS");
+        assert!(matches!(items.last().unwrap().src, Src::Slot(s) if s.meta().env == "VICTORY_PRELOAD"));
+        let mut page = Curated::new(Tab::Home);
+        // Twelve lines, ten of them in view at once (the memory readout stays under them).
+        assert_eq!(page.rows(), live::ROWS);
+        assert_eq!(page.view(60.0, 16.0).lines.len(), live::ROWS - 2);
+        // Up from the first line goes round to the last, which asks for the preload; Graphics and Performance have the four lines only.
+        assert_eq!(page.step(Action::Up), None);
+        assert_eq!(page.view(60.0, 16.0).lines.last().unwrap().label, "PRELOAD NOW (RESTART)");
+        assert_eq!(page.step(Action::Enter), Some(Act::PreloadNow));
+        for tab in [Tab::Graphics, Tab::Performance] {
+            let page = Curated::new(tab);
+            assert_eq!(page.rows(), page.items.len() + 4);
+        }
+    }
+
+    #[test]
     fn home_has_the_frame_cap_frame_generation_and_the_overlay_switch() {
         let items = home_items();
         let labels: Vec<&str> = items.iter().map(|i| i.label).collect();
         assert_eq!(&labels[..3], ["FRAME RATE CAP", "FRAME GENERATION", "OVERLAY"]);
         let page = Curated::new(Tab::Home);
-        assert_eq!(page.rows(), items.len() + 4);
+        assert_eq!(page.rows(), items.len() + 5);
         let mut v = page.view(58.2, 17.2);
         v.mem = Some(Readouts { gpu_used: 21_300 << 20, gpu_budget: 24_170 << 20, fps: 58.2, frame_ms: 17.2 });
         assert_eq!(v.tally, "");
