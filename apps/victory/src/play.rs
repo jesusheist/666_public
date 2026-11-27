@@ -89,6 +89,9 @@ const KEPT: &[&str] = &[
     "VICTORY_DATA_DIR",
     "VICTORY_STREAMLINE_DIR",
     "VICTORY_LOG",
+    "VICTORY_LOG_SUBJECTS",
+    "VICTORY_SHOTS_DIR",
+    "VICTORY_LIVE_SETTINGS",
 ];
 
 const RESOLUTIONS: [&str; 4] = ["1440", "1080", "1080to1440", "4k"];
@@ -267,6 +270,18 @@ fn log_file(logs: &Path) -> Result<PathBuf> {
     for gone in old.iter().rev().skip(9) {
         let _ = std::fs::remove_file(gone);
     }
+    // The per-run folders (`--set VICTORY_LOG_DIR=auto`): the last nine stay too.
+    let mut runs: Vec<PathBuf> = std::fs::read_dir(logs)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir() && p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("run-")))
+        .collect();
+    runs.sort();
+    for gone in runs.iter().rev().skip(9) {
+        let _ = std::fs::remove_dir_all(gone);
+    }
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
     Ok(logs.join(format!("play-{}-{}.log", stamp(now), std::process::id())))
 }
@@ -378,6 +393,14 @@ pub(crate) fn prepare(o: &Play) -> Result<Ready> {
         .with_context(|| format!("writing {}", log.display()))?;
     println!("Log: {}", log.display());
     s.insert("VICTORY_LOG_FILE".to_owned(), log.to_string_lossy().into_owned());
+    // `--set VICTORY_LOG_DIR=auto`: one folder for this run beside the log file, with a file per
+    // subject (all, gpu-crash, memory, textures, shaders, perf, title, hle, input, draws).
+    if s.get("VICTORY_LOG_DIR").is_some_and(|d| d == "auto") {
+        let name = log.file_stem().map(|n| n.to_string_lossy().replacen("play-", "run-", 1)).unwrap_or_default();
+        let dir = log.with_file_name(name);
+        println!("Log folder: {}", dir.display());
+        s.insert("VICTORY_LOG_DIR".to_owned(), dir.to_string_lossy().into_owned());
+    }
 
     let leftover: Vec<String> = std::env::vars_os()
         .filter_map(|(k, _)| k.into_string().ok())
