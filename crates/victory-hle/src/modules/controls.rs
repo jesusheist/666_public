@@ -618,6 +618,8 @@ const VEHICLE: &[(&str, &[&str])] = &[
     ("Num8", &["LeanForward"]),
     ("Num5", &["LeanBack"]),
     ("Space", &["Handbrake"]),
+    // Shift would reach the handbrake through Sprint (A in a vehicle): the handbrake is Space alone.
+    ("LShift", &[]),
     ("E", &["Horn"]),
     ("H", &["Headlights"]),
     ("LCtrl", &["Duck"]),
@@ -631,7 +633,8 @@ const VEHICLE: &[(&str, &[&str])] = &[
     ("WheelUp", &["ScopeIn"]),
     ("WheelDown", &["ScopeOut"]),
     ("MouseLeft", &["Shoot"]),
-    ("MouseRight", &["Aim"]),
+    // Aim is LT, which is the brake and reverse in a vehicle: aiming from a vehicle goes on LB.
+    ("MouseRight", &["LB"]),
     ("MouseMiddle", &["LookBehind"]),
     ("Up", &["Phone"]),
     ("Down", &["PartnerMenu"]),
