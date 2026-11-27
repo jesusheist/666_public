@@ -633,8 +633,9 @@ const VEHICLE: &[(&str, &[&str])] = &[
     ("WheelUp", &["ScopeIn"]),
     ("WheelDown", &["ScopeOut"]),
     ("MouseLeft", &["Shoot"]),
-    // Aim is LT, which is the brake and reverse in a vehicle: aiming from a vehicle goes on LB.
-    ("MouseRight", &["LB"]),
+    // Aim is LT, which is the brake and reverse in a vehicle, and the title's vehicle scheme has no aim
+    // (RB shoots, LB is holster and loadout): the right button does nothing in a vehicle.
+    ("MouseRight", &[]),
     ("MouseMiddle", &["LookBehind"]),
     ("Up", &["Phone"]),
     ("Down", &["PartnerMenu"]),

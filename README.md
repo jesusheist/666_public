@@ -35,7 +35,7 @@ scanner and checked over two launches. Format: `<hex address | img+hex offset>[:
 |---|---|---|
 | W A S D | Move | Accelerate, steer left, brake and reverse, steer right |
 | Mouse | Camera | Camera |
-| Mouse left / right | Shoot / aim | Shoot / aim (pad LB; LT would be the brake) |
+| Mouse left / right | Shoot / aim | Shoot / (nothing: the title has no aim in a vehicle, LT is the brake) |
 | Mouse middle | Look behind | Look behind |
 | Wheel up / down | Scope in / out | Scope in / out |
 | Space | Jump | Handbrake |
