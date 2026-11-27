@@ -9274,8 +9274,6 @@ struct Meter {
     copy_stats_frames: u64,
     drawn: u64,
     logged: std::time::Instant,
-    /// The caption the window had, once read.
-    caption: Option<Vec<u16>>,
 }
 
 impl Meter {
@@ -9288,7 +9286,6 @@ impl Meter {
             copy_stats_frames: 0,
             drawn: crate::draw::drawn(),
             logged: now,
-            caption: None,
         }
     }
 
@@ -9713,21 +9710,17 @@ impl Meter {
                 }
             }
         }
-        if self.caption.is_none() {
-            // The window's own text, read without a message.
-            let mut buffer = vec![0u16; 512];
-            // SAFETY: a window handle and a buffer of that length.
-            let n = unsafe { InternalGetWindowText(hwnd, &mut buffer) };
-            buffer.truncate(n.max(0) as usize);
-            self.caption = Some(buffer);
-        }
-        let Some(caption) = &self.caption else { return };
+        // The title bar: "666 | 30 fps 33.3 ms/frame 4 draws/frame | <our keys>", every second (the
+        // title's own caption is not kept; only the text is set, the window's icon is not touched).
         // With frame generation showing more frames than are rendered, both rates.
-        let text = match crate::streamline::shown_per_frame() {
-            1 => format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame"),
-            per => format!(" | VIctory {fps:.0} fps (frame gen {:.0} fps) {ms:.1} ms/frame {draws:.0} draws/frame", fps * f64::from(per)),
+        let rates = match crate::streamline::shown_per_frame() {
+            1 => format!("{fps:.0} fps"),
+            per => format!("{fps:.0} fps (frame gen {:.0} fps)", fps * f64::from(per)),
         };
-        let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
+        let text = format!(
+            "666 | {rates} {ms:.1} ms/frame {draws:.0} draws/frame | F10 or F1 menu   F2 overlay   G car keys on/off"
+        );
+        let mut text: Vec<u16> = text.encode_utf16().collect();
         text.push(0);
         // Setting the text waits for the window's thread (a title thread,
         // which may not pump for a while), so a thread of ours does it and
