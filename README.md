@@ -1,5 +1,19 @@
 # 666
 
+**Branch `mcp`**: the MCP server (`VICTORY_MCP=47820`, JSON-RPC on 127.0.0.1) that lets a tool or an
+AI agent drive and inspect the running game.
+
+Tools now:
+- State and pictures: `get_stats`, `get_memory`, `get_settings`, `screenshot`, `find_bad_pixels`,
+  `get_dropped_draws`, `get_pipeline_events`, `get_recent_log`, `get_device_lost_report`.
+- Settings: `set_setting`, `list_tunables`, `get_tunable`, `set_tunable`, `reset_tunable`.
+- Remote pad (works without the window having focus): `press`, `stick`, `release_all`, `input_script`.
+- Memory scanner over the title's memory: `mem_regions`, `mem_scan_start`, `mem_scan_filter`,
+  `mem_scan_list`, `mem_read`, `mem_scan_reset`.
+
+Next on this branch: more of the title's state readable by name (position, vehicle, mission), and A/B timing
+over a fixed range of the title's frames.
+
 A fork of the VIctory runtime (by way of cool_fox) that plays the Xbox Series build
 of the title on a Windows PC. The focus here is playing it with a keyboard and
 mouse, plus tools to find what the title keeps in memory.
