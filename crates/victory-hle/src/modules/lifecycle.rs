@@ -459,6 +459,12 @@ pub(crate) fn hook(hwnd: HWND) {
         if previous == procedure || previous == 0 {
             return;
         }
+        // Already in the chain under another subclass (ScriptHook VI's overlay hooks the window after us): a
+        // second install would store that subclass as the title's procedure while it calls ours, and the two
+        // would call each other until the stack runs out.
+        if !wm::GetPropW(hwnd, TITLE_PROC).is_null() {
+            return;
+        }
         if wm::SetPropW(hwnd, TITLE_PROC, previous as *mut c_void) == 0 {
             tracing::warn!("could not store the game window procedure");
             return;
@@ -1059,6 +1065,36 @@ mod tests {
             let n = wm::GetWindowTextW(hwnd, text.as_mut_ptr(), 16);
             assert_eq!(String::from_utf16_lossy(&text[..n as usize]), "after");
             assert!(!wm::GetPropW(hwnd, TITLE_PROC).is_null());
+            wm::DestroyWindow(hwnd);
+        }
+    }
+
+    /// Another subclass on top of ours (ScriptHook VI's overlay), then a second `hook` (focus regained): ours must
+    /// not go on top again, or the two procedures would call each other until the stack overflows.
+    #[test]
+    fn a_second_hook_under_another_subclass_does_not_loop() {
+        static OUTER_NEXT: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+        unsafe extern "system" fn outer(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+            // SAFETY: the procedure stored below, called the way the system would.
+            unsafe {
+                let next = std::mem::transmute::<isize, wm::WNDPROC>(OUTER_NEXT.load(std::sync::atomic::Ordering::SeqCst));
+                wm::CallWindowProcW(next, hwnd, msg, w, l)
+            }
+        }
+        let null = std::ptr::null_mut();
+        let hwnd = CreateWindowExW(0, w!("STATIC"), w!("before"), 0, 0, 0, 10, 10, null, null, null, std::ptr::null());
+        assert!(!hwnd.is_null());
+        // SAFETY: our window; `outer` forwards to the procedure it replaced.
+        unsafe {
+            let ours = wm::GetWindowLongPtrW(hwnd, wm::GWLP_WNDPROC);
+            OUTER_NEXT.store(ours, std::sync::atomic::Ordering::SeqCst);
+            wm::SetWindowLongPtrW(hwnd, wm::GWLP_WNDPROC, outer as *const () as isize);
+            hook(hwnd);
+            assert_eq!(wm::GetWindowLongPtrW(hwnd, wm::GWLP_WNDPROC), outer as *const () as isize);
+            wm::SetWindowTextW(hwnd, w!("after"));
+            let mut text = [0u16; 16];
+            let n = wm::GetWindowTextW(hwnd, text.as_mut_ptr(), 16);
+            assert_eq!(String::from_utf16_lossy(&text[..n as usize]), "after");
             wm::DestroyWindow(hwnd);
         }
     }
